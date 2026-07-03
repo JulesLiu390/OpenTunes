@@ -338,6 +338,63 @@ def serve(
     uvicorn.run("music_taste_rec.api:create_app", factory=True, host=host, port=port, reload=reload)
 
 
+def _build_song_store():
+    """Construct a SongStore wired to R2 from environment, like the running API."""
+    import os
+
+    from music_taste_rec.api import (
+        AUTH_DB_PATH_ENV,
+        DEFAULT_AUTH_DB_PATH,
+    )
+    from openband.songs import (
+        DEFAULT_SONG_STORAGE_ROOT,
+        SONG_STORAGE_ROOT_ENV,
+        SongStore,
+    )
+    from openband.storage import (
+        local_cache_days,
+        presigned_url_ttl,
+        r2_storage_from_env,
+    )
+
+    return SongStore(
+        db_path=Path(os.getenv(AUTH_DB_PATH_ENV, str(DEFAULT_AUTH_DB_PATH))),
+        storage_root=Path(os.getenv(SONG_STORAGE_ROOT_ENV, str(DEFAULT_SONG_STORAGE_ROOT))),
+        object_storage=r2_storage_from_env(),
+        cache_days=local_cache_days(),
+        url_ttl=presigned_url_ttl(),
+    )
+
+
+@app.command()
+def migrate_r2(
+    overwrite: Annotated[bool, typer.Option(help="Re-upload even if the object already exists in R2.")] = False,
+) -> None:
+    """Backfill existing songs (audio + extracted covers) into Cloudflare R2."""
+    store = _build_song_store()
+    if store.object_storage is None:
+        console.print("[red]R2 is not configured.[/red] Set OPENBAND_R2_* environment variables first.")
+        raise typer.Exit(code=1)
+    console.print("Uploading existing songs to R2…")
+    result = store.offload_existing_to_r2(overwrite=overwrite)
+    console.print(
+        f"Uploaded [bold]{result['uploaded']}[/bold] audio, [bold]{result['covers']}[/bold] covers, "
+        f"skipped [bold]{result['skipped']}[/bold] (already present), "
+        f"missing-local [bold]{result['missing']}[/bold]."
+    )
+
+
+@app.command()
+def prune_cache() -> None:
+    """Delete cached local MP3s older than the retention window once R2 has them."""
+    store = _build_song_store()
+    if store.object_storage is None:
+        console.print("[yellow]R2 is not configured; skipping prune (local is the only copy).[/yellow]")
+        raise typer.Exit(code=0)
+    removed = store.prune_local_cache()
+    console.print(f"Pruned [bold]{removed}[/bold] local cached file(s) older than {store.cache_days} day(s).")
+
+
 def _print_frame(frame: pd.DataFrame, title: str) -> None:
     table = Table(title=title)
     for column in frame.columns:

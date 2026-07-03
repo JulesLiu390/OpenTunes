@@ -4,10 +4,14 @@ import { Platform } from "react-native";
 import { ApiError, authFetch, getApiBaseUrl, getFreshAccessToken, loadStoredSession } from "@/lib/auth";
 import { readUserCache, writeUserCache } from "@/lib/cache";
 
-const CACHE_DIR = `${FileSystem.documentDirectory ?? ""}openband-songs/`;
+const SONG_CATALOG_DIR = `${FileSystem.documentDirectory ?? ""}openband-songs/`;
+const DOWNLOADS_DOCUMENT_DIR = `${FileSystem.documentDirectory ?? ""}openband-downloads/`;
+const DOWNLOADS_CACHE_DIR = `${FileSystem.cacheDirectory ?? FileSystem.documentDirectory ?? ""}openband-downloads/`;
+const PLAYBACK_CACHE_DIR = `${FileSystem.cacheDirectory ?? FileSystem.documentDirectory ?? ""}openband-playback/`;
 const COVER_CACHE_DIR = `${FileSystem.documentDirectory ?? ""}openband-covers/`;
 const SONG_CATALOG_STORAGE_KEY_PREFIX = "openband.songs.catalog";
 const COVER_STORAGE_KEY_PREFIX = "openband.song_covers";
+const DOWNLOAD_SETTINGS_NAMESPACE = "download-settings";
 
 export type Song = {
   id: string;
@@ -43,6 +47,12 @@ export type SongCacheResult = {
 };
 
 export type SongCacheStatus = "cached" | "downloading" | "remote";
+
+export type DownloadLocation = "app" | "temporary";
+
+export type DownloadSettings = {
+  location: DownloadLocation;
+};
 
 export type SongCacheBatchItem = {
   song: Song;
@@ -357,9 +367,13 @@ export async function getCachedSongUri(song: Song): Promise<string | null> {
   if (!canUseNativeCache()) {
     return null;
   }
-  const uri = cacheUriForSong(song);
-  const info = await FileSystem.getInfoAsync(uri);
-  return info.exists ? uri : null;
+  for (const uri of await downloadUrisForSong(song)) {
+    const info = await FileSystem.getInfoAsync(uri);
+    if (info.exists) {
+      return uri;
+    }
+  }
+  return null;
 }
 
 export async function cacheSong(song: Song, accessToken: string): Promise<SongCacheResult> {
@@ -372,8 +386,9 @@ export async function cacheSong(song: Song, accessToken: string): Promise<SongCa
     return { uri: cachedUri, cached: true };
   }
 
-  await ensureCacheDirectory();
-  const uri = cacheUriForSong(song);
+  const settings = await getDownloadSettingsForCurrentUser();
+  const uri = downloadUriForSong(song, settings.location);
+  await ensureDownloadDirectory(settings.location);
   const freshAccessToken = await getFreshAccessToken(accessToken);
   const result = await FileSystem.downloadAsync(absoluteSongUrl(song.download_url), uri, {
     headers: {
@@ -385,6 +400,79 @@ export async function cacheSong(song: Song, accessToken: string): Promise<SongCa
     throw new ApiError(`Download failed with status ${result.status}.`, result.status);
   }
   return { uri: result.uri, cached: true };
+}
+
+export async function cacheSongForPlayback(song: Song, accessToken: string): Promise<SongCacheResult> {
+  if (!canUseNativeCache()) {
+    return { uri: absoluteSongUrl(song.download_url), cached: false };
+  }
+  const cachedUri = await getCachedSongUri(song);
+  if (cachedUri) {
+    return { uri: cachedUri, cached: true };
+  }
+
+  await ensurePlaybackCacheDirectory();
+  const uri = playbackCacheUriForSong(song);
+  const info = await FileSystem.getInfoAsync(uri);
+  if (!info.exists) {
+    const freshAccessToken = await getFreshAccessToken(accessToken);
+    const result = await FileSystem.downloadAsync(absoluteSongUrl(song.download_url), uri, {
+      headers: {
+        Authorization: `Bearer ${freshAccessToken}`,
+      },
+    });
+    if (result.status < 200 || result.status >= 300) {
+      await FileSystem.deleteAsync(uri, { idempotent: true });
+      throw new ApiError(`Playback failed with status ${result.status}.`, result.status);
+    }
+  }
+  await prunePlaybackCache(uri);
+  return { uri, cached: false };
+}
+
+export async function deleteCachedSong(song: Song): Promise<boolean> {
+  if (!canUseNativeCache()) {
+    return false;
+  }
+  let deleted = false;
+  for (const uri of await downloadUrisForSong(song)) {
+    const info = await FileSystem.getInfoAsync(uri);
+    if (!info.exists) {
+      continue;
+    }
+    await FileSystem.deleteAsync(uri, { idempotent: true });
+    deleted = true;
+  }
+  return deleted;
+}
+
+export async function getDownloadSettings(
+  userId: number | null | undefined,
+): Promise<DownloadSettings> {
+  const snapshot = await readUserCache<DownloadSettings>(DOWNLOAD_SETTINGS_NAMESPACE, userId);
+  const location = snapshot?.data?.location;
+  return {
+    location: location === "temporary" ? "temporary" : "app",
+  };
+}
+
+export async function setDownloadLocation(
+  userId: number | null | undefined,
+  location: DownloadLocation,
+): Promise<DownloadSettings> {
+  const settings: DownloadSettings = { location };
+  await writeUserCache(DOWNLOAD_SETTINGS_NAMESPACE, userId, settings);
+  return settings;
+}
+
+export function downloadLocationLabel(location: DownloadLocation): string {
+  return location === "temporary" ? "Temporary Cache" : "App Downloads";
+}
+
+export function downloadLocationDescription(location: DownloadLocation): string {
+  return location === "temporary"
+    ? "Stores new downloads in the app cache. The system may clear them."
+    : "Stores new downloads in the app's persistent documents area until you delete them.";
 }
 
 export async function cacheSongs(
@@ -529,8 +617,28 @@ export function readableFileSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function cacheUriForSong(song: Song): string {
-  return `${CACHE_DIR}${song.id}-${song.file_sha256.slice(0, 16)}.mp3`;
+async function getDownloadSettingsForCurrentUser(): Promise<DownloadSettings> {
+  const session = await loadStoredSession();
+  return getDownloadSettings(session?.user.id);
+}
+
+async function downloadUrisForSong(song: Song): Promise<string[]> {
+  const settings = await getDownloadSettingsForCurrentUser();
+  const preferred = downloadUriForSong(song, settings.location);
+  const fallback = downloadUriForSong(song, settings.location === "app" ? "temporary" : "app");
+  return preferred === fallback ? [preferred] : [preferred, fallback];
+}
+
+function downloadUriForSong(song: Song, location: DownloadLocation): string {
+  return `${downloadDirectory(location)}${song.id}-${song.file_sha256.slice(0, 16)}.mp3`;
+}
+
+function playbackCacheUriForSong(song: Song): string {
+  return `${PLAYBACK_CACHE_DIR}${song.id}-${song.file_sha256.slice(0, 16)}.mp3`;
+}
+
+function downloadDirectory(location: DownloadLocation): string {
+  return location === "temporary" ? DOWNLOADS_CACHE_DIR : DOWNLOADS_DOCUMENT_DIR;
 }
 
 function coverCacheUriForSong(song: Song): string {
@@ -546,7 +654,7 @@ function songCoverStorageKey(song: Song): string {
 }
 
 function songCatalogPath(userId: number | null | undefined): string {
-  return `${CACHE_DIR}catalog-${songCatalogId(userId)}.json`;
+  return `${SONG_CATALOG_DIR}catalog-${songCatalogId(userId)}.json`;
 }
 
 function songCatalogStorageKey(userId: number | null | undefined): string {
@@ -604,9 +712,24 @@ function blobToDataUri(blob: Blob): Promise<string> {
 }
 
 async function ensureCacheDirectory(): Promise<void> {
-  const info = await FileSystem.getInfoAsync(CACHE_DIR);
+  const info = await FileSystem.getInfoAsync(SONG_CATALOG_DIR);
   if (!info.exists) {
-    await FileSystem.makeDirectoryAsync(CACHE_DIR, { intermediates: true });
+    await FileSystem.makeDirectoryAsync(SONG_CATALOG_DIR, { intermediates: true });
+  }
+}
+
+async function ensureDownloadDirectory(location: DownloadLocation): Promise<void> {
+  const dir = downloadDirectory(location);
+  const info = await FileSystem.getInfoAsync(dir);
+  if (!info.exists) {
+    await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+  }
+}
+
+async function ensurePlaybackCacheDirectory(): Promise<void> {
+  const info = await FileSystem.getInfoAsync(PLAYBACK_CACHE_DIR);
+  if (!info.exists) {
+    await FileSystem.makeDirectoryAsync(PLAYBACK_CACHE_DIR, { intermediates: true });
   }
 }
 
@@ -619,6 +742,22 @@ async function ensureCoverCacheDirectory(): Promise<void> {
 
 function canUseNativeCache(): boolean {
   return Platform.OS !== "web" && Boolean(FileSystem.documentDirectory);
+}
+
+async function prunePlaybackCache(keepUri: string): Promise<void> {
+  try {
+    const files = await FileSystem.readDirectoryAsync(PLAYBACK_CACHE_DIR);
+    await Promise.all(
+      files.map(async (file) => {
+        const uri = `${PLAYBACK_CACHE_DIR}${file}`;
+        if (uri !== keepUri) {
+          await FileSystem.deleteAsync(uri, { idempotent: true });
+        }
+      }),
+    );
+  } catch {
+    // Playback cache cleanup is best-effort.
+  }
 }
 
 export function absoluteSongUrl(path: string): string {

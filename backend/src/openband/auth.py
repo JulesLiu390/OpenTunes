@@ -271,6 +271,10 @@ class AuthStore:
         updated_at = rows[0]["updated_at"] if rows else None
         return MusicTagsResponse(tags=[row["tag"] for row in rows], updated_at=updated_at)
 
+    def get_user(self, user_id: int) -> AuthUser | None:
+        with self._connect() as conn:
+            return self._get_user(conn, user_id)
+
     def set_music_tags(self, user_id: int, tags: list[str]) -> MusicTagsResponse:
         clean_tags = _clean_tags(tags)
         now = utc_now()

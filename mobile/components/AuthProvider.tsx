@@ -124,7 +124,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
 
   const login = useCallback(
     async (key: string, options?: { apiBaseUrl?: string }) => {
-      const nextSession = await loginWithInviteKey(key, `OpenBand ${Platform.OS}`, options?.apiBaseUrl);
+      const nextSession = await loginWithInviteKey(key, `OpenTunes ${Platform.OS}`, options?.apiBaseUrl);
       await applySession(nextSession);
     },
     [applySession],

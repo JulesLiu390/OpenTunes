@@ -1,4 +1,4 @@
-# OpenBand Daily Playlist System
+# OpenTunes Daily Playlist System
 
 Simple English guide.
 
@@ -12,7 +12,7 @@ This file explains three things:
 
 ## Short Version
 
-OpenBand does not start by asking the AI to make random songs.
+OpenTunes does not start by asking the AI to make random songs.
 
 It starts with **music taste tags**.
 

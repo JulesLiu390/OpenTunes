@@ -5,10 +5,14 @@ import { Platform } from "react-native";
 import { useAuth } from "@/components/AuthProvider";
 import { ApiError, getFreshAccessToken } from "@/lib/auth";
 import { readUserCache, writeUserCache } from "@/lib/cache";
-import { absoluteSongUrl, cacheSong, Song, SongCacheResult } from "@/lib/songs";
+import { absoluteSongUrl, cacheSongForPlayback, getCachedSongUri, Song, SongCacheResult } from "@/lib/songs";
 
 export type PlaybackOrder = "sequence" | "shuffle";
-export type RepeatMode = "pause" | "loop";
+export type RepeatMode = "pause" | "loop" | "one";
+// Unified, music-app style play mode surfaced to the UI as a single cycling control.
+// "list" plays through once and stops; "sequence" loops the list; "shuffle" reshuffles
+// and keeps playing; "one" repeats the current track.
+export type PlayMode = "list" | "sequence" | "shuffle" | "one";
 export type PlaySongSource = "playlist" | "daily" | "library" | "adHoc";
 
 type PlaySongOptions = {
@@ -36,6 +40,7 @@ type PlayerContextValue = {
   queue: Song[];
   playbackOrder: PlaybackOrder;
   repeatMode: RepeatMode;
+  playMode: PlayMode;
   busySongId: string | null;
   error: string | null;
   isPlaying: boolean;
@@ -51,6 +56,7 @@ type PlayerContextValue = {
   seekTo: (seconds: number) => Promise<void>;
   cyclePlaybackOrder: () => void;
   cycleRepeatMode: () => void;
+  cyclePlayMode: () => void;
   setPlaybackOrder: (order: PlaybackOrder) => void;
   setRepeatMode: (mode: RepeatMode) => void;
   updateCurrentSongLike: (songId: string, isLiked: boolean, likedAt: string | null) => void;
@@ -70,7 +76,7 @@ export function PlayerProvider({ children }: PropsWithChildren) {
   const [currentIndex, setCurrentIndex] = useState(-1);
   const [currentUri, setCurrentUri] = useState<string | null>(null);
   const [playbackOrder, setPlaybackOrderState] = useState<PlaybackOrder>("sequence");
-  const [repeatMode, setRepeatModeState] = useState<RepeatMode>("pause");
+  const [repeatMode, setRepeatModeState] = useState<RepeatMode>("loop");
   const [busySongId, setBusySongId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [restoredCurrentTime, setRestoredCurrentTime] = useState(0);
@@ -80,7 +86,10 @@ export function PlayerProvider({ children }: PropsWithChildren) {
   const currentIndexRef = useRef(-1);
   const currentUriRef = useRef<string | null>(null);
   const playbackOrderRef = useRef<PlaybackOrder>("sequence");
-  const repeatModeRef = useRef<RepeatMode>("pause");
+  const repeatModeRef = useRef<RepeatMode>("loop");
+  // True once the current track has played to its end and we are sitting paused on it,
+  // so the play button restarts the song from the beginning instead of no-op at the end.
+  const endedRef = useRef(false);
   const busySongIdRef = useRef<string | null>(null);
   const restoredSongIdRef = useRef<string | null>(null);
   const restoredCurrentTimeRef = useRef(0);
@@ -198,7 +207,8 @@ export function PlayerProvider({ children }: PropsWithChildren) {
       currentIndexRef.current = restoredIndex;
       currentSongRef.current = cachedSong;
       playbackOrderRef.current = cached.playbackOrder === "shuffle" ? "shuffle" : "sequence";
-      repeatModeRef.current = cached.repeatMode === "loop" ? "loop" : "pause";
+      repeatModeRef.current =
+        cached.repeatMode === "one" ? "one" : cached.repeatMode === "pause" ? "pause" : "loop";
       restoredSongIdRef.current = cachedSong.id;
       restoredCurrentTimeRef.current = restoredTime;
 
@@ -330,8 +340,13 @@ export function PlayerProvider({ children }: PropsWithChildren) {
       if (current?.id === song.id && currentUriRef.current) {
         setError(null);
         lastAutoAdvanceKeyRef.current = null;
-        player.play();
-        return { uri: currentUriRef.current, cached: Platform.OS !== "web" };
+        if (endedRef.current) {
+          endedRef.current = false;
+          player.seekTo(0).then(() => player.play()).catch(() => player.play());
+        } else {
+          player.play();
+        }
+        return { uri: currentUriRef.current, cached: Boolean(await getCachedSongUri(song)) };
       }
 
       setBusySongId(song.id);
@@ -347,6 +362,7 @@ export function PlayerProvider({ children }: PropsWithChildren) {
         currentSongRef.current = song;
         currentUriRef.current = playable.uri;
         lastAutoAdvanceKeyRef.current = null;
+        endedRef.current = false;
         setCurrentSong(song);
         setCurrentUri(playable.uri);
         player.replace({ uri: playable.uri, name: song.title });
@@ -456,6 +472,21 @@ export function PlayerProvider({ children }: PropsWithChildren) {
     return true;
   }, [startSong]);
 
+  const replayCurrentFromStart = useCallback(async () => {
+    if (!currentUriRef.current) {
+      return false;
+    }
+    endedRef.current = false;
+    lastAutoAdvanceKeyRef.current = null;
+    try {
+      await player.seekTo(0);
+    } catch {
+      // Some platforms reject seek until metadata is ready; playback can still start.
+    }
+    player.play();
+    return true;
+  }, [player]);
+
   useEffect(() => {
     const song = currentSongRef.current;
     if (!song) {
@@ -471,9 +502,13 @@ export function PlayerProvider({ children }: PropsWithChildren) {
     if (!finished) {
       if (effectiveDuration > 0 && effectiveTime < Math.max(0, effectiveDuration - 2)) {
         lastAutoAdvanceKeyRef.current = null;
+        endedRef.current = false;
       }
       return;
     }
+
+    // The track reached its end. Remember it so a manual play press restarts it.
+    endedRef.current = true;
 
     const autoAdvanceKey = `${song.id}:${Math.floor(effectiveDuration || 0)}`;
     if (lastAutoAdvanceKeyRef.current === autoAdvanceKey || autoAdvanceInFlightRef.current) {
@@ -481,14 +516,16 @@ export function PlayerProvider({ children }: PropsWithChildren) {
     }
     lastAutoAdvanceKeyRef.current = autoAdvanceKey;
     autoAdvanceInFlightRef.current = true;
-    nextSong()
+    // Single-song loop replays the same track; other modes advance the queue.
+    const advance = repeatModeRef.current === "one" ? replayCurrentFromStart() : nextSong();
+    Promise.resolve(advance)
       .catch(() => {
         // Keep the player stable if automatic advance cannot prepare the next song.
       })
       .finally(() => {
         autoAdvanceInFlightRef.current = false;
       });
-  }, [nextSong, status.currentTime, status.didJustFinish, status.duration, status.isBuffering, status.playing]);
+  }, [nextSong, replayCurrentFromStart, status.currentTime, status.didJustFinish, status.duration, status.isBuffering, status.playing]);
 
   const togglePlayPause = useCallback(() => {
     const song = currentSongRef.current;
@@ -510,8 +547,13 @@ export function PlayerProvider({ children }: PropsWithChildren) {
       });
       return;
     }
+    if (endedRef.current) {
+      // Track finished and is paused at the end: play should replay from the start.
+      void replayCurrentFromStart();
+      return;
+    }
     player.play();
-  }, [player, startSong, status.playing]);
+  }, [player, replayCurrentFromStart, startSong, status.playing]);
 
   const pause = useCallback(() => {
     player.pause();
@@ -549,6 +591,24 @@ export function PlayerProvider({ children }: PropsWithChildren) {
     setRepeatMode(repeatModeRef.current === "pause" ? "loop" : "pause");
   }, [setRepeatMode]);
 
+  // Single music-app style control cycling 列表播放 → 顺序循环 → 乱序 → 单曲循环.
+  const cyclePlayMode = useCallback(() => {
+    const current = resolvePlayMode(playbackOrderRef.current, repeatModeRef.current);
+    if (current === "list") {
+      setPlaybackOrder("sequence");
+      setRepeatMode("loop"); // 顺序循环
+    } else if (current === "sequence") {
+      setPlaybackOrder("shuffle");
+      setRepeatMode("loop"); // 乱序(一直播放)
+    } else if (current === "shuffle") {
+      setPlaybackOrder("sequence");
+      setRepeatMode("one"); // 单曲循环
+    } else {
+      setPlaybackOrder("sequence");
+      setRepeatMode("pause"); // 列表播放(播完停)
+    }
+  }, [setPlaybackOrder, setRepeatMode]);
+
   const updateCurrentSongLike = useCallback((songId: string, isLiked: boolean, likedAt: string | null) => {
     const updateSong = (song: Song) => (song.id === songId ? { ...song, is_liked: isLiked, liked_at: likedAt } : song);
     setCurrentSong((song) => (song ? updateSong(song) : song));
@@ -566,12 +626,15 @@ export function PlayerProvider({ children }: PropsWithChildren) {
       : 0
     : clampPlaybackTime(restoredCurrentTime, duration);
 
+  const playMode: PlayMode = resolvePlayMode(playbackOrder, repeatMode);
+
   const value = useMemo<PlayerContextValue>(
     () => ({
       currentSong,
       queue,
       playbackOrder,
       repeatMode,
+      playMode,
       busySongId,
       error,
       isPlaying: Boolean(status.playing),
@@ -587,6 +650,7 @@ export function PlayerProvider({ children }: PropsWithChildren) {
       seekTo,
       cyclePlaybackOrder,
       cycleRepeatMode,
+      cyclePlayMode,
       setPlaybackOrder,
       setRepeatMode,
       updateCurrentSongLike,
@@ -597,6 +661,7 @@ export function PlayerProvider({ children }: PropsWithChildren) {
       currentTime,
       cyclePlaybackOrder,
       cycleRepeatMode,
+      cyclePlayMode,
       duration,
       error,
       nextSong,
@@ -604,6 +669,7 @@ export function PlayerProvider({ children }: PropsWithChildren) {
       playNext,
       playSong,
       playbackOrder,
+      playMode,
       previousSong,
       queue,
       repeatMode,
@@ -646,7 +712,7 @@ export function PlayerProvider({ children }: PropsWithChildren) {
       if (nextIndex < songs.length) {
         return { song: songs[nextIndex], index: nextIndex };
       }
-      if (repeat === "loop") {
+      if (repeat === "loop" || repeat === "one") {
         return { song: songs[0], index: 0 };
       }
       return null;
@@ -656,7 +722,7 @@ export function PlayerProvider({ children }: PropsWithChildren) {
     if (candidates.length > 0) {
       return pickRandomSong(candidates);
     }
-    if (repeat === "loop") {
+    if (repeat === "loop" || repeat === "one") {
       shufflePlayedIdsRef.current = new Set([current.id]);
       const resetCandidates = songs
         .map((song, songIndex) => ({ song, index: songIndex }))
@@ -686,7 +752,7 @@ export function PlayerProvider({ children }: PropsWithChildren) {
     if (index > 0) {
       return { song: songs[index - 1], index: index - 1 };
     }
-    if (repeatModeRef.current === "loop" && songs.length > 1) {
+    if ((repeatModeRef.current === "loop" || repeatModeRef.current === "one") && songs.length > 1) {
       return { song: songs[songs.length - 1], index: songs.length - 1 };
     }
     return null;
@@ -702,8 +768,13 @@ export function usePlayer() {
 }
 
 async function preparePlayableSong(song: Song, accessToken: string): Promise<SongCacheResult> {
+  const cachedUri = await getCachedSongUri(song);
+  if (cachedUri) {
+    return { uri: cachedUri, cached: true };
+  }
+
   if (Platform.OS !== "web") {
-    return cacheSong(song, accessToken);
+    return cacheSongForPlayback(song, accessToken);
   }
 
   const freshAccessToken = await getFreshAccessToken(accessToken);
@@ -717,6 +788,16 @@ async function preparePlayableSong(song: Song, accessToken: string): Promise<Son
   }
   const blob = await response.blob();
   return { uri: URL.createObjectURL(blob), cached: false };
+}
+
+function resolvePlayMode(order: PlaybackOrder, repeat: RepeatMode): PlayMode {
+  if (repeat === "one") {
+    return "one";
+  }
+  if (order === "shuffle") {
+    return "shuffle";
+  }
+  return repeat === "pause" ? "list" : "sequence";
 }
 
 function normalizeQueue(song: Song, queue: Song[]): Song[] {

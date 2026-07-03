@@ -3,6 +3,12 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.playwright-mcp/
+android-*-build.log
+backend-dev.log
+login-staged.png
+openband-frontend.png
+user24-*.png
 
 .env
 .env.*

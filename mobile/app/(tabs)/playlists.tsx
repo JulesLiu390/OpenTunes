@@ -9,6 +9,7 @@ import { MusicPage } from "@/components/MusicPage";
 import { usePlayer } from "@/components/PlayerProvider";
 import { SongActionMenu } from "@/components/SongActionMenu";
 import { SongArtwork } from "@/components/SongArtwork";
+import { SongListRow } from "@/components/SongListRow";
 import {
   createPlaylist,
   getPlaylist,
@@ -23,6 +24,8 @@ import {
   Song,
   SongCacheStatus,
   cacheSong,
+  deleteCachedSong,
+  formatDuration,
   getSongCacheStatuses,
   listSongs,
   loadSongListCache,
@@ -307,9 +310,6 @@ export default function PlaylistsScreen() {
     if (!selectedPlaylist) {
       return;
     }
-    if (cacheStatus[song.id] !== "cached") {
-      setCacheStatus((current) => ({ ...current, [song.id]: "downloading" }));
-    }
     try {
       const result = await playSong(song, selectedPlaylist.songs, { playlistId: selectedPlaylist.id, source: "playlist" });
       if (result) {
@@ -336,13 +336,18 @@ export default function PlaylistsScreen() {
     }
     setCacheStatus((current) => ({ ...current, [song.id]: "downloading" }));
     try {
-      await cacheSong(song, session.accessToken);
+      const result = await cacheSong(song, session.accessToken);
       await mergeSongCatalog(session.user.id, [song]);
-      setCacheStatus((current) => ({ ...current, [song.id]: "cached" }));
+      setCacheStatus((current) => ({ ...current, [song.id]: result.cached ? "cached" : "remote" }));
     } catch (exc) {
       setCacheStatus((current) => ({ ...current, [song.id]: "remote" }));
       throw exc;
     }
+  }
+
+  async function removeDownload(song: Song) {
+    await deleteCachedSong(song);
+    setCacheStatus((current) => ({ ...current, [song.id]: "remote" }));
   }
 
   function updateSongLike(songId: string, isLiked: boolean, likedAt: string | null) {
@@ -491,54 +496,34 @@ export default function PlaylistsScreen() {
                 const displaySong = currentSong?.id === song.id ? currentSong : song;
                 const tagPreview = songTagSummary(displaySong);
                 return (
-                  <Pressable
+                  <SongListRow
+                    accessToken={session?.accessToken ?? null}
+                    action={
+                      <SongActionMenu
+                        accessToken={session?.accessToken ?? null}
+                        canRemoveFromPlaylist
+                        currentPlaylistId={selectedPlaylist.id}
+                        isDownloaded={cacheStatus[displaySong.id] === "cached"}
+                        isLiked={Boolean(displaySong.is_liked)}
+                        onAddedToPlaylist={refreshAfterPlaylistChange}
+                        onDownload={downloadSong}
+                        onLikeChanged={updateSongLike}
+                        onRemovedFromPlaylist={refreshAfterPlaylistChange}
+                        onRemoveDownload={removeDownload}
+                        removeFromPlaylistLabel={selectedIsSystem ? "Remove from Liked Music" : "Remove from This List"}
+                        song={displaySong}
+                      />
+                    }
+                    colors={artworkPalettes[index % artworkPalettes.length]}
+                    isCached={cacheStatus[song.id] === "cached"}
                     key={song.id}
                     onPress={() => playFromPlaylist(song)}
-                    style={({ pressed }) => [styles.row, pressed && styles.pressed]}>
-                    <SongArtwork
-                      accessToken={session?.accessToken ?? null}
-                      colors={artworkPalettes[index % artworkPalettes.length]}
-                      size={54}
-                      song={displaySong}
-                    />
-                    <View style={styles.rowCopy}>
-                      <View style={styles.titleLine}>
-                        <Text style={styles.rowTitle} numberOfLines={1}>
-                          {displaySong.title}
-                        </Text>
-                        {displaySong.is_liked ? <Text style={styles.likeBadge}>♥</Text> : null}
-                      </View>
-                      {tagPreview ? (
-                        <Text style={styles.rowMeta} numberOfLines={1}>
-                          {tagPreview}
-                        </Text>
-                      ) : null}
-                      <Text style={[styles.rowDetail, currentSong?.id === song.id && styles.activeText]}>
-                        {busySongId === song.id || cacheStatus[song.id] === "downloading"
-                          ? "Loading"
-                          : currentSong?.id === song.id && isPlaying
-                            ? "Playing"
-                            : cacheStatus[song.id] === "cached"
-                              ? "Downloaded"
-                              : selectedIsSystem
-                                ? "Liked"
-                                : "In playlist"}
-                      </Text>
-                    </View>
-                    <SongActionMenu
-                      accessToken={session?.accessToken ?? null}
-                      canRemoveFromPlaylist
-                      currentPlaylistId={selectedPlaylist.id}
-                      isDownloaded={cacheStatus[displaySong.id] === "cached"}
-                      isLiked={Boolean(displaySong.is_liked)}
-                      onAddedToPlaylist={refreshAfterPlaylistChange}
-                      onDownload={downloadSong}
-                      onLikeChanged={updateSongLike}
-                      onRemovedFromPlaylist={refreshAfterPlaylistChange}
-                      removeFromPlaylistLabel={selectedIsSystem ? "Remove from Liked Music" : "Remove from This List"}
-                      song={displaySong}
-                    />
-                  </Pressable>
+                    isLiked={Boolean(displaySong.is_liked)}
+                    song={displaySong}
+                    statusActive={currentSong?.id === song.id}
+                    statusText={playlistSongStatusText(song, cacheStatus[song.id], busySongId, currentSong?.id, isPlaying)}
+                    subtitle={tagPreview}
+                  />
                 );
               })
             ) : (
@@ -556,38 +541,32 @@ export default function PlaylistsScreen() {
           <Text style={styles.sectionTitle}>Add Songs</Text>
           <View style={styles.list}>
             {availableSongs.map((song, index) => {
-              const tagPreview = songTagSummary(song);
+              const displaySong = currentSong?.id === song.id ? currentSong : song;
+              const tagPreview = songTagSummary(displaySong);
               return (
-                <View key={song.id} style={styles.row}>
-                  <SongArtwork
-                    accessToken={session?.accessToken ?? null}
-                    colors={artworkPalettes[(index + 2) % artworkPalettes.length]}
-                    size={54}
-                    song={song}
-                  />
-                  <View style={styles.rowCopy}>
-                    <View style={styles.titleLine}>
-                      <Text style={styles.rowTitle} numberOfLines={1}>
-                        {song.title}
-                      </Text>
-                      {song.is_liked ? <Text style={styles.likeBadge}>♥</Text> : null}
-                    </View>
-                    {tagPreview ? (
-                      <Text style={styles.rowMeta} numberOfLines={1}>
-                        {tagPreview}
-                      </Text>
-                    ) : null}
-                  </View>
-                  <SongActionMenu
-                    accessToken={session?.accessToken ?? null}
-                    isDownloaded={cacheStatus[song.id] === "cached"}
-                    isLiked={Boolean(song.is_liked)}
-                    onAddedToPlaylist={refreshAfterPlaylistChange}
-                    onDownload={downloadSong}
-                    onLikeChanged={updateSongLike}
-                    song={song}
-                  />
-                </View>
+                <SongListRow
+                  accessToken={session?.accessToken ?? null}
+                  action={
+                    <SongActionMenu
+                      accessToken={session?.accessToken ?? null}
+                      isDownloaded={cacheStatus[displaySong.id] === "cached"}
+                      isLiked={Boolean(displaySong.is_liked)}
+                      onAddedToPlaylist={refreshAfterPlaylistChange}
+                      onDownload={downloadSong}
+                      onLikeChanged={updateSongLike}
+                      onRemoveDownload={removeDownload}
+                      song={displaySong}
+                    />
+                  }
+                  colors={artworkPalettes[(index + 2) % artworkPalettes.length]}
+                  isCached={cacheStatus[song.id] === "cached"}
+                  isLiked={Boolean(displaySong.is_liked)}
+                  key={song.id}
+                  song={displaySong}
+                  statusActive={currentSong?.id === song.id}
+                  statusText={playlistSongStatusText(song, cacheStatus[song.id], busySongId, currentSong?.id, isPlaying)}
+                  subtitle={tagPreview}
+                />
               );
             })}
             {loadingCatalogMore ? <Text style={styles.loadingMoreText}>Loading more songs</Text> : null}
@@ -723,6 +702,22 @@ function coverSongStub(songId: string): Song {
     created_at: "",
     updated_at: "",
   };
+}
+
+function playlistSongStatusText(
+  song: Song,
+  cacheStatus: SongCacheStatus | undefined,
+  busySongId: string | null,
+  currentSongId: string | undefined,
+  isPlaying: boolean,
+): string {
+  if (busySongId === song.id || cacheStatus === "downloading") {
+    return "Loading";
+  }
+  if (currentSongId === song.id && isPlaying) {
+    return "Playing";
+  }
+  return formatDuration(song.duration_seconds);
 }
 
 const styles = StyleSheet.create({
@@ -878,7 +873,7 @@ const styles = StyleSheet.create({
     marginTop: "auto",
   },
   list: {
-    gap: 9,
+    gap: 8,
   },
   row: {
     alignItems: "center",

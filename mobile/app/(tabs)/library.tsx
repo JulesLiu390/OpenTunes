@@ -7,16 +7,17 @@ import { useAuth } from "@/components/AuthProvider";
 import { MusicPage } from "@/components/MusicPage";
 import { usePlayer } from "@/components/PlayerProvider";
 import { SongActionMenu } from "@/components/SongActionMenu";
-import { SongArtwork } from "@/components/SongArtwork";
+import { SongListRow } from "@/components/SongListRow";
 import {
   Song,
   SongCacheStatus,
   cacheSong,
+  deleteCachedSong,
+  formatDuration,
   getSongCacheStatuses,
   listSongs,
   loadSongListCache,
   loadCachedSongs,
-  readableFileSize,
   saveSongListCache,
   songListCacheKey,
   songTagSummary,
@@ -156,9 +157,6 @@ export default function LibraryScreen() {
       return;
     }
 
-    if (cacheStatus[song.id] !== "cached") {
-      setCacheStatus((current) => ({ ...current, [song.id]: "downloading" }));
-    }
     try {
       const result = await playSong(song, undefined, { source: "library" });
       if (result) {
@@ -177,12 +175,17 @@ export default function LibraryScreen() {
     }
     setCacheStatus((current) => ({ ...current, [song.id]: "downloading" }));
     try {
-      await cacheSong(song, session.accessToken);
-      setCacheStatus((current) => ({ ...current, [song.id]: "cached" }));
+      const result = await cacheSong(song, session.accessToken);
+      setCacheStatus((current) => ({ ...current, [song.id]: result.cached ? "cached" : "remote" }));
     } catch (exc) {
       setCacheStatus((current) => ({ ...current, [song.id]: "remote" }));
       throw exc;
     }
+  }
+
+  async function removeDownload(song: Song) {
+    await deleteCachedSong(song);
+    setCacheStatus((current) => ({ ...current, [song.id]: "remote" }));
   }
 
   function updateSongLike(songId: string, isLiked: boolean, likedAt: string | null) {
@@ -313,36 +316,29 @@ export default function LibraryScreen() {
             {visibleSongs.map((song, index) => {
               const displaySong = currentSong?.id === song.id ? currentSong : song;
               return (
-                <Pressable
+                <SongListRow
+                  accessToken={session?.accessToken ?? null}
+                  action={
+                    <SongActionMenu
+                      accessToken={session?.accessToken ?? null}
+                      isDownloaded={cacheStatus[displaySong.id] === "cached"}
+                      isLiked={Boolean(displaySong.is_liked)}
+                      onDownload={downloadSong}
+                      onLikeChanged={updateSongLike}
+                      onRemoveDownload={removeDownload}
+                      song={displaySong}
+                    />
+                  }
+                  colors={artworkPalettes[index % artworkPalettes.length]}
+                  isCached={cacheStatus[song.id] === "cached"}
                   key={song.id}
                   onPress={() => selectSong(song)}
-                  style={({ pressed }) => [styles.row, pressed && styles.pressed]}>
-                  <SongArtwork
-                    accessToken={session?.accessToken ?? null}
-                    colors={artworkPalettes[index % artworkPalettes.length]}
-                    size={58}
-                    song={displaySong}
-                  />
-                  <View style={styles.rowCopy}>
-                    <View style={styles.titleLine}>
-                      <Text style={styles.rowTitle} numberOfLines={1}>
-                        {displaySong.title}
-                      </Text>
-                      {displaySong.is_liked ? <Text style={styles.likeBadge}>♥</Text> : null}
-                    </View>
-                    <Text style={styles.rowDetail} numberOfLines={1}>
-                      {songDetailText(song, cacheStatus[song.id], busySongId, currentSong?.id, isPlaying)}
-                    </Text>
-                  </View>
-                  <SongActionMenu
-                    accessToken={session?.accessToken ?? null}
-                    isDownloaded={cacheStatus[displaySong.id] === "cached"}
-                    isLiked={Boolean(displaySong.is_liked)}
-                    onDownload={downloadSong}
-                    onLikeChanged={updateSongLike}
-                    song={displaySong}
-                  />
-                </Pressable>
+                  isLiked={Boolean(displaySong.is_liked)}
+                  song={displaySong}
+                  statusActive={currentSong?.id === song.id}
+                  statusText={songStatusText(song, cacheStatus[song.id], busySongId, currentSong?.id, isPlaying)}
+                  subtitle={songTagSummary(displaySong)}
+                />
               );
             })}
             {loadingMore ? (
@@ -357,7 +353,7 @@ export default function LibraryScreen() {
   );
 }
 
-function songDetailText(
+function songStatusText(
   song: Song,
   cacheStatus: SongCacheStatus | undefined,
   busySongId: string | null,
@@ -370,11 +366,7 @@ function songDetailText(
   if (currentSongId === song.id && isPlaying) {
     return "Playing";
   }
-  if (cacheStatus === "cached") {
-    return "Cached";
-  }
-  const tagPreview = songTagSummary(song);
-  return tagPreview ? `${readableFileSize(song.file_size)} · ${tagPreview}` : readableFileSize(song.file_size);
+  return formatDuration(song.duration_seconds);
 }
 
 type TagFacet = {
@@ -586,7 +578,7 @@ const styles = StyleSheet.create({
     color: theme.colors.tint,
   },
   list: {
-    gap: 9,
+    gap: 8,
   },
   row: {
     alignItems: "center",

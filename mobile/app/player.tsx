@@ -1,5 +1,6 @@
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import {
   ActivityIndicator,
   Animated,
@@ -20,8 +21,9 @@ import {
 import { VolumeManager } from "react-native-volume-manager";
 
 import { useAuth } from "@/components/AuthProvider";
-import { PlaybackOrder, RepeatMode, usePlayer } from "@/components/PlayerProvider";
+import { PlayMode, usePlayer } from "@/components/PlayerProvider";
 import { SongArtwork } from "@/components/SongArtwork";
+import { SongListRow } from "@/components/SongListRow";
 import { currentTrack } from "@/lib/demo";
 import { formatDuration, getSong, setSongLiked, songTagSummary, type Song } from "@/lib/songs";
 import { getMusicTags, setMusicTags } from "@/lib/taste";
@@ -41,13 +43,11 @@ export default function PlayerScreen() {
     duration,
     isPlaying,
     nextSong,
-    playbackOrder,
+    playMode,
     playSong,
     previousSong,
     queue,
-    repeatMode,
-    cyclePlaybackOrder,
-    cycleRepeatMode,
+    cyclePlayMode,
     seekTo,
     togglePlayPause,
     updateCurrentSongLike,
@@ -418,18 +418,11 @@ export default function PlayerScreen() {
 
         <View style={styles.bottomActions}>
           <Pressable
-            accessibilityLabel={repeatModeLabel(repeatMode)}
+            accessibilityLabel={playModeLabel(playMode)}
             accessibilityRole="button"
-            onPress={cycleRepeatMode}
-            style={({ pressed }) => [styles.actionButton, repeatMode === "loop" && styles.activeActionButton, pressed && styles.pressed]}>
-            <Text style={[styles.actionIcon, repeatMode === "loop" && styles.activeActionIcon]}>{repeatModeIcon(repeatMode)}</Text>
-          </Pressable>
-          <Pressable
-            accessibilityLabel={playbackOrderLabel(playbackOrder)}
-            accessibilityRole="button"
-            onPress={cyclePlaybackOrder}
-            style={({ pressed }) => [styles.actionButton, playbackOrder === "shuffle" && styles.activeActionButton, pressed && styles.pressed]}>
-            <Text style={[styles.actionIcon, playbackOrder === "shuffle" && styles.activeActionIcon]}>{playbackOrderIcon(playbackOrder)}</Text>
+            onPress={cyclePlayMode}
+            style={({ pressed }) => [styles.actionButton, styles.activeActionButton, pressed && styles.pressed]}>
+            <MaterialCommunityIcons name={playModeIcon(playMode)} size={24} color={theme.colors.tint} />
           </Pressable>
           <Pressable
             accessibilityLabel="Show queue list"
@@ -466,26 +459,18 @@ export default function PlayerScreen() {
                     const active = currentSong?.id === song.id;
                     const tagPreview = songTagSummary(song);
                     return (
-                      <Pressable
-                        accessibilityRole="button"
+                      <SongListRow
+                        accessToken={session?.accessToken ?? null}
+                        colors={artworkPalettes[index % artworkPalettes.length]}
                         key={song.id}
                         onPress={() => {
                           playQueuedSong(song.id);
                         }}
-                        style={({ pressed }) => [styles.queueRow, active && styles.queueRowActive, pressed && styles.pressed]}>
-                        <Text style={[styles.queueIndex, active && styles.queueIndexActive]}>{index + 1}</Text>
-                        <View style={styles.queueCopy}>
-                          <Text style={[styles.queueSongTitle, active && styles.queueSongTitleActive]} numberOfLines={1}>
-                            {song.title}
-                          </Text>
-                          {tagPreview ? (
-                            <Text style={styles.queueSongMeta} numberOfLines={1}>
-                              {tagPreview}
-                            </Text>
-                          ) : null}
-                        </View>
-                        <Text style={styles.queueDuration}>{formatDuration(song.duration_seconds)}</Text>
-                      </Pressable>
+                        song={song}
+                        statusActive={active}
+                        statusText={formatDuration(song.duration_seconds)}
+                        subtitle={tagPreview}
+                      />
                     );
                   })
                 )}
@@ -1092,8 +1077,32 @@ const styles = StyleSheet.create({
   },
 });
 
-function repeatModeIcon(mode: RepeatMode): string {
-  return mode === "loop" ? "↻" : "Ⅱ";
+type IconName = ComponentProps<typeof MaterialCommunityIcons>["name"];
+
+function playModeIcon(mode: PlayMode): IconName {
+  if (mode === "shuffle") {
+    return "shuffle";
+  }
+  if (mode === "one") {
+    return "repeat-once";
+  }
+  if (mode === "list") {
+    return "playlist-play";
+  }
+  return "repeat";
+}
+
+function playModeLabel(mode: PlayMode): string {
+  if (mode === "shuffle") {
+    return "Shuffle";
+  }
+  if (mode === "one") {
+    return "Repeat one";
+  }
+  if (mode === "list") {
+    return "Play list once";
+  }
+  return "Repeat all";
 }
 
 function clampVolume(value: number): number {
@@ -1109,18 +1118,6 @@ function timeForTrackOffset(offsetX: number, width: number, duration: number): n
   }
   const ratio = Math.max(0, Math.min(1, offsetX / width));
   return ratio * duration;
-}
-
-function repeatModeLabel(mode: RepeatMode): string {
-  return mode === "loop" ? "Loop list after ending" : "Pause after list ends";
-}
-
-function playbackOrderIcon(order: PlaybackOrder): string {
-  return order === "shuffle" ? "⌁" : "→";
-}
-
-function playbackOrderLabel(order: PlaybackOrder): string {
-  return order === "shuffle" ? "Shuffle playback order" : "Sequence playback order";
 }
 
 function normalizeTagKey(tag: string): string {

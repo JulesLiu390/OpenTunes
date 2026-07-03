@@ -16,7 +16,7 @@
     </style>
   </defs>
   <rect class="bg" x="0" y="0" width="1200" height="700"/>
-  <text class="title" x="54" y="68">OpenBand daily playlist, in one picture</text>
+  <text class="title" x="54" y="68">OpenTunes daily playlist, in one picture</text>
   <text class="small" x="56" y="102">The system starts with taste. It ends with songs in the app.</text>
 
   <rect class="card" x="55" y="170" width="170" height="145"/>

@@ -5,6 +5,13 @@ import { ActivityIndicator, Modal, Pressable, StyleSheet, Text, TextInput, View 
 import { Section } from "@/components/AppShell";
 import { useAuth } from "@/components/AuthProvider";
 import { MusicPage } from "@/components/MusicPage";
+import {
+  DownloadLocation,
+  downloadLocationDescription,
+  downloadLocationLabel,
+  getDownloadSettings,
+  setDownloadLocation as saveDownloadLocation,
+} from "@/lib/songs";
 import { getMusicTags, loadCachedMusicTags, subscribeMusicTags } from "@/lib/taste";
 import { theme } from "@/lib/theme";
 import { APP_VERSION } from "@/lib/version";
@@ -19,6 +26,9 @@ export default function MeScreen() {
   const [logoutConfirmVisible, setLogoutConfirmVisible] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [savingName, setSavingName] = useState(false);
+  const [downloadLocation, setDownloadLocationState] = useState<DownloadLocation>("app");
+  const [downloadSettingsVisible, setDownloadSettingsVisible] = useState(false);
+  const [savingDownloadLocation, setSavingDownloadLocation] = useState(false);
   const [tags, setTags] = useState<string[]>([]);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
   const sortedTags = useMemo(() => [...tags].sort((left, right) => left.localeCompare(right)), [tags]);
@@ -58,6 +68,16 @@ export default function MeScreen() {
       setUpdatedAt(response.updated_at);
     });
   }, []);
+
+  useEffect(() => {
+    if (!session) {
+      setDownloadLocationState("app");
+      return;
+    }
+    getDownloadSettings(session.user.id)
+      .then((settings) => setDownloadLocationState(settings.location))
+      .catch(() => setDownloadLocationState("app"));
+  }, [session]);
 
   useFocusEffect(
     useCallback(() => {
@@ -113,6 +133,20 @@ export default function MeScreen() {
     }
   }
 
+  async function chooseDownloadLocation(location: DownloadLocation) {
+    if (!session || savingDownloadLocation) {
+      return;
+    }
+    setSavingDownloadLocation(true);
+    try {
+      const settings = await saveDownloadLocation(session.user.id, location);
+      setDownloadLocationState(settings.location);
+      setDownloadSettingsVisible(false);
+    } finally {
+      setSavingDownloadLocation(false);
+    }
+  }
+
   return (
     <MusicPage>
       <Section>
@@ -127,7 +161,7 @@ export default function MeScreen() {
           </View>
           <View style={styles.profileCopy}>
             <Text style={styles.name} numberOfLines={1}>
-              {user?.label ?? "OpenBand Friend"}
+              {user?.label ?? "OpenTunes Friend"}
             </Text>
             <Text style={styles.meta}>{tags.length ? `${tags.length} taste tags` : "No taste tags yet"}</Text>
           </View>
@@ -169,6 +203,23 @@ export default function MeScreen() {
             <Text style={styles.emptyText}>Add favorites to generate your first music tags.</Text>
           </View>
         )}
+      </Section>
+
+      <Section>
+        <View style={styles.downloadPanel}>
+          <View style={styles.profileCopy}>
+            <Text style={styles.versionLabel}>Download Location</Text>
+            <Text style={styles.downloadMeta}>{downloadLocationLabel(downloadLocation)}</Text>
+            <Text style={styles.downloadDescription}>{downloadLocationDescription(downloadLocation)}</Text>
+          </View>
+          <Pressable
+            accessibilityLabel="Change download location"
+            accessibilityRole="button"
+            onPress={() => setDownloadSettingsVisible(true)}
+            style={({ pressed }) => [styles.editButton, pressed && styles.pressed]}>
+            <Text style={styles.editButtonText}>Change</Text>
+          </Pressable>
+        </View>
       </Section>
 
       <Section>
@@ -274,6 +325,62 @@ export default function MeScreen() {
                 <Text style={styles.confirmButtonText}>{savingName ? "Saving" : "Save"}</Text>
               </Pressable>
             </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        animationType="fade"
+        transparent
+        visible={downloadSettingsVisible}
+        onRequestClose={() => {
+          if (!savingDownloadLocation) {
+            setDownloadSettingsVisible(false);
+          }
+        }}>
+        <View style={styles.modalRoot}>
+          <Pressable
+            accessibilityLabel="Cancel download location change"
+            disabled={savingDownloadLocation}
+            onPress={() => setDownloadSettingsVisible(false)}
+            style={styles.backdrop}
+          />
+          <View style={styles.confirmPanel}>
+            <Text style={styles.confirmTitle}>Download location</Text>
+            <Text style={styles.confirmText}>Choose where new manual downloads are stored on this device.</Text>
+            <View style={styles.locationOptions}>
+              {(["app", "temporary"] as DownloadLocation[]).map((location) => {
+                const selected = downloadLocation === location;
+                return (
+                  <Pressable
+                    accessibilityRole="button"
+                    disabled={savingDownloadLocation}
+                    key={location}
+                    onPress={() => chooseDownloadLocation(location)}
+                    style={({ pressed }) => [
+                      styles.locationOption,
+                      selected && styles.locationOptionSelected,
+                      pressed && styles.pressed,
+                      savingDownloadLocation && styles.disabled,
+                    ]}>
+                    <View style={styles.locationCopy}>
+                      <Text style={[styles.locationTitle, selected && styles.locationTitleSelected]}>
+                        {downloadLocationLabel(location)}
+                      </Text>
+                      <Text style={styles.locationDescription}>{downloadLocationDescription(location)}</Text>
+                    </View>
+                    <Text style={[styles.locationCheck, selected && styles.locationCheckSelected]}>{selected ? "✓" : ""}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <Pressable
+              accessibilityRole="button"
+              disabled={savingDownloadLocation}
+              onPress={() => setDownloadSettingsVisible(false)}
+              style={({ pressed }) => [styles.cancelButton, pressed && styles.pressed, savingDownloadLocation && styles.disabled]}>
+              <Text style={styles.cancelText}>Done</Text>
+            </Pressable>
           </View>
         </View>
       </Modal>
@@ -438,6 +545,28 @@ const styles = StyleSheet.create({
     minHeight: 50,
     paddingHorizontal: 14,
   },
+  downloadPanel: {
+    alignItems: "center",
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radius.md,
+    flexDirection: "row",
+    gap: 12,
+    minHeight: 78,
+    padding: 14,
+  },
+  downloadMeta: {
+    color: theme.colors.tint,
+    fontSize: 13,
+    fontWeight: "900",
+    marginTop: 4,
+  },
+  downloadDescription: {
+    color: theme.colors.secondaryText,
+    fontSize: 12,
+    fontWeight: "700",
+    lineHeight: 17,
+    marginTop: 3,
+  },
   versionLabel: {
     color: theme.colors.text,
     fontSize: 15,
@@ -506,6 +635,52 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 10,
     marginTop: 4,
+  },
+  locationOptions: {
+    gap: 8,
+  },
+  locationOption: {
+    alignItems: "center",
+    backgroundColor: theme.colors.background,
+    borderColor: theme.colors.hairline,
+    borderRadius: theme.radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    flexDirection: "row",
+    gap: 10,
+    minHeight: 74,
+    padding: 12,
+  },
+  locationOptionSelected: {
+    backgroundColor: theme.colors.tintSoft,
+    borderColor: theme.colors.tint,
+  },
+  locationCopy: {
+    flex: 1,
+    minWidth: 0,
+  },
+  locationTitle: {
+    color: theme.colors.text,
+    fontSize: 15,
+    fontWeight: "900",
+  },
+  locationTitleSelected: {
+    color: theme.colors.tint,
+  },
+  locationDescription: {
+    color: theme.colors.secondaryText,
+    fontSize: 12,
+    fontWeight: "700",
+    lineHeight: 17,
+    marginTop: 3,
+  },
+  locationCheck: {
+    color: theme.colors.tint,
+    fontSize: 18,
+    fontWeight: "900",
+    width: 22,
+  },
+  locationCheckSelected: {
+    color: theme.colors.tint,
   },
   cancelButton: {
     alignItems: "center",

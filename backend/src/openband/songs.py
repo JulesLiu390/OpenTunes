@@ -5,18 +5,23 @@ import secrets
 import shutil
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from mutagen import MutagenError
 from mutagen.id3 import ID3, ID3NoHeaderError
 from pydantic import BaseModel, Field
 
 from music_taste_rec.style_model import parse_style_tags
 from openband.auth import AuthUser, current_user_dependency
+from openband.storage import (
+    DEFAULT_LOCAL_CACHE_DAYS,
+    DEFAULT_URL_TTL_SECONDS,
+    ObjectStorage,
+)
 
 
 DEFAULT_SONG_STORAGE_ROOT = Path("storage/songs")
@@ -66,6 +71,7 @@ class StoredSong:
     created_at: str
     updated_at: str
     tags: list[str]
+    has_cover: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +117,7 @@ class SongResponse(BaseModel):
     audio_url: str
     download_url: str
     cover_url: str
+    has_cover: bool = False
     is_liked: bool = False
     liked_at: str | None = None
     created_at: str
@@ -168,12 +175,123 @@ class PlaylistDetailResponse(PlaylistResponse):
 
 
 class SongStore:
-    def __init__(self, db_path: Path, storage_root: Path = DEFAULT_SONG_STORAGE_ROOT):
+    def __init__(
+        self,
+        db_path: Path,
+        storage_root: Path = DEFAULT_SONG_STORAGE_ROOT,
+        *,
+        object_storage: ObjectStorage | None = None,
+        cache_days: int = DEFAULT_LOCAL_CACHE_DAYS,
+        url_ttl: int = DEFAULT_URL_TTL_SECONDS,
+    ):
         self.db_path = Path(db_path)
         self.storage_root = Path(storage_root)
+        self.object_storage = object_storage
+        self.cache_days = cache_days
+        self.url_ttl = url_ttl
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.storage_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    @staticmethod
+    def audio_key(song_id: str) -> str:
+        return f"songs/{song_id}.mp3"
+
+    @staticmethod
+    def cover_key(song_id: str) -> str:
+        return f"covers/{song_id}.jpg"
+
+    def _offload_to_r2(self, song_id: str, final_path: Path, mime_type: str) -> bool:
+        """Upload the audio (and extracted cover) to R2. Returns whether a cover exists.
+
+        With no object storage configured the backend stays purely local; the
+        return value still reflects whether the MP3 carries embedded cover art so
+        the ``/cover`` route can short-circuit consistently.
+        """
+        cover = extract_mp3_cover(final_path)
+        if self.object_storage is None:
+            return cover is not None
+        self.object_storage.upload_file(self.audio_key(song_id), final_path, mime_type or "audio/mpeg")
+        if cover is not None:
+            self.object_storage.upload_bytes(self.cover_key(song_id), cover.data, cover.mime_type)
+        return cover is not None
+
+    def local_audio_path(self, song: StoredSong) -> Path | None:
+        """The cached local MP3 if it still exists, else ``None`` (pruned/offloaded)."""
+        path = Path(song.file_path)
+        return path if path.exists() else None
+
+    def audio_redirect_url(self, song: StoredSong) -> str | None:
+        if self.object_storage is None:
+            return None
+        return self.object_storage.presigned_get_url(
+            self.audio_key(song.id),
+            expires_in=self.url_ttl,
+            download_filename=song.original_filename,
+            content_type=song.mime_type or "audio/mpeg",
+        )
+
+    def cover_redirect_url(self, song: StoredSong) -> str | None:
+        if self.object_storage is None or not song.has_cover:
+            return None
+        return self.object_storage.presigned_get_url(
+            self.cover_key(song.id),
+            expires_in=self.url_ttl,
+        )
+
+    def prune_local_cache(self, *, now: datetime | None = None) -> int:
+        """Delete cached local MP3s older than ``cache_days`` once R2 has the copy.
+
+        Never deletes anything when R2 is not configured (local is then the only
+        copy). Returns the number of files removed.
+        """
+        if self.object_storage is None:
+            return 0
+        now = now or datetime.now(UTC)
+        cutoff = now - timedelta(days=self.cache_days)
+        removed = 0
+        with self._connect() as conn:
+            rows = conn.execute("SELECT id, file_path, created_at FROM songs").fetchall()
+        for row in rows:
+            path = Path(row["file_path"])
+            if not path.exists():
+                continue
+            created = _parse_iso_timestamp(row["created_at"])
+            if created is None or created > cutoff:
+                continue
+            if not self.object_storage.exists(self.audio_key(row["id"])):
+                continue
+            path.unlink(missing_ok=True)
+            removed += 1
+        return removed
+
+    def offload_existing_to_r2(self, *, overwrite: bool = False) -> dict[str, int]:
+        """Backfill: ensure every existing song's audio and cover live in R2."""
+        if self.object_storage is None:
+            raise RuntimeError("R2 object storage is not configured.")
+        with self._connect() as conn:
+            rows = conn.execute("SELECT id, file_path, mime_type FROM songs").fetchall()
+        uploaded = covers = skipped = missing = 0
+        for row in rows:
+            song_id = row["id"]
+            path = Path(row["file_path"])
+            if not path.exists():
+                missing += 1
+                continue
+            audio_key = self.audio_key(song_id)
+            if not overwrite and self.object_storage.exists(audio_key):
+                skipped += 1
+            else:
+                self.object_storage.upload_file(audio_key, path, row["mime_type"] or "audio/mpeg")
+                uploaded += 1
+            cover = extract_mp3_cover(path)
+            has_cover = cover is not None
+            if has_cover:
+                self.object_storage.upload_bytes(self.cover_key(song_id), cover.data, cover.mime_type)
+                covers += 1
+            with self._connect() as conn:
+                conn.execute("UPDATE songs SET has_cover = ? WHERE id = ?", (1 if has_cover else 0, song_id))
+        return {"uploaded": uploaded, "covers": covers, "skipped": skipped, "missing": missing}
 
     async def create_song_from_upload(
         self,
@@ -210,6 +328,8 @@ class SongStore:
 
         now = utc_now()
         clean_tags = _clean_song_tags(tags)
+        mime_type = upload.content_type or "audio/mpeg"
+        has_cover = self._offload_to_r2(song_id, final_path, mime_type)
         song = StoredSong(
             id=song_id,
             title=title.strip(),
@@ -221,38 +341,13 @@ class SongStore:
             file_path=str(final_path),
             file_size=file_size,
             file_sha256=hasher.hexdigest(),
-            mime_type=upload.content_type or "audio/mpeg",
+            mime_type=mime_type,
             created_at=now,
             updated_at=now,
             tags=clean_tags,
+            has_cover=has_cover,
         )
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO songs (
-                    id, title, artist, album, duration_seconds, source,
-                    original_filename, file_path, file_size, file_sha256,
-                    mime_type, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    song.id,
-                    song.title,
-                    song.artist,
-                    song.album,
-                    song.duration_seconds,
-                    song.source,
-                    song.original_filename,
-                    song.file_path,
-                    song.file_size,
-                    song.file_sha256,
-                    song.mime_type,
-                    song.created_at,
-                    song.updated_at,
-                ),
-            )
-            self._replace_tags(conn, song.id, song.tags)
+        self._insert_song(song)
         return song
 
     def create_song_from_file(
@@ -265,6 +360,7 @@ class SongStore:
         tags: str | list[str] = "",
         duration_seconds: int | None = None,
         source: str = "manual",
+        offload_to_object_storage: bool = True,
     ) -> StoredSong:
         source_path = Path(source_path)
         filename = source_path.name
@@ -293,6 +389,11 @@ class SongStore:
 
         now = utc_now()
         clean_tags = _clean_song_tags(tags)
+        has_cover = (
+            self._offload_to_r2(song_id, final_path, "audio/mpeg")
+            if offload_to_object_storage
+            else extract_mp3_cover(final_path) is not None
+        )
         song = StoredSong(
             id=song_id,
             title=title.strip(),
@@ -308,16 +409,21 @@ class SongStore:
             created_at=now,
             updated_at=now,
             tags=clean_tags,
+            has_cover=has_cover,
         )
+        self._insert_song(song)
+        return song
+
+    def _insert_song(self, song: StoredSong) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO songs (
                     id, title, artist, album, duration_seconds, source,
                     original_filename, file_path, file_size, file_sha256,
-                    mime_type, created_at, updated_at
+                    mime_type, created_at, updated_at, has_cover
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     song.id,
@@ -333,10 +439,10 @@ class SongStore:
                     song.mime_type,
                     song.created_at,
                     song.updated_at,
+                    1 if song.has_cover else 0,
                 ),
             )
             self._replace_tags(conn, song.id, song.tags)
-        return song
 
     def list_songs(
         self,
@@ -741,6 +847,7 @@ class SongStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             tags=[tag_row["tag"] for tag_row in tag_rows],
+            has_cover=bool(row["has_cover"]) if "has_cover" in row.keys() else False,
         )
 
     def _song_exists(self, conn: sqlite3.Connection, song_id: str) -> bool:
@@ -819,7 +926,8 @@ class SongStore:
                     mime_type TEXT NOT NULL DEFAULT 'audio/mpeg',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    deleted_at TEXT
+                    deleted_at TEXT,
+                    has_cover INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS song_tags (
@@ -880,6 +988,9 @@ class SongStore:
             playlist_columns = {row["name"] for row in conn.execute("PRAGMA table_info(playlists)").fetchall()}
             if "cover_song_id" not in playlist_columns:
                 conn.execute("ALTER TABLE playlists ADD COLUMN cover_song_id TEXT")
+            song_columns = {row["name"] for row in conn.execute("PRAGMA table_info(songs)").fetchall()}
+            if "has_cover" not in song_columns:
+                conn.execute("ALTER TABLE songs ADD COLUMN has_cover INTEGER NOT NULL DEFAULT 0")
 
 
 def create_song_router(
@@ -1009,23 +1120,28 @@ def create_song_router(
     def song_audio(
         song_id: str,
         _user: AuthUser | None = Depends(current_user),
-    ) -> FileResponse:
+    ) -> Response:
         try:
             song = store.get_song(song_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Song not found.") from exc
-        path = Path(song.file_path)
-        if not path.exists():
+        # Local-first: serve from the 7-day cache when present, otherwise redirect
+        # to a short-lived presigned R2 URL so bytes never proxy through the API.
+        path = store.local_audio_path(song)
+        if path is not None:
+            return FileResponse(
+                path,
+                media_type=song.mime_type or "audio/mpeg",
+                filename=song.original_filename,
+                headers={
+                    "ETag": song.file_sha256,
+                    "Cache-Control": "private, max-age=31536000, immutable",
+                },
+            )
+        redirect_url = store.audio_redirect_url(song)
+        if redirect_url is None:
             raise HTTPException(status_code=404, detail="Song file not found.")
-        return FileResponse(
-            path,
-            media_type=song.mime_type or "audio/mpeg",
-            filename=song.original_filename,
-            headers={
-                "ETag": song.file_sha256,
-                "Cache-Control": "private, max-age=31536000, immutable",
-            },
-        )
+        return RedirectResponse(redirect_url, status_code=302)
 
     @router.get("/{song_id}/cover")
     def song_cover(
@@ -1036,20 +1152,23 @@ def create_song_router(
             song = store.get_song(song_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Song not found.") from exc
-        path = Path(song.file_path)
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="Song file not found.")
-        cover = extract_mp3_cover(path)
-        if cover is None:
+        path = store.local_audio_path(song)
+        if path is not None:
+            cover = extract_mp3_cover(path)
+            if cover is None:
+                raise HTTPException(status_code=404, detail="Song cover not found.")
+            return Response(
+                content=cover.data,
+                media_type=cover.mime_type,
+                headers={
+                    "ETag": cover.file_sha256,
+                    "Cache-Control": "private, max-age=31536000, immutable",
+                },
+            )
+        redirect_url = store.cover_redirect_url(song)
+        if redirect_url is None:
             raise HTTPException(status_code=404, detail="Song cover not found.")
-        return Response(
-            content=cover.data,
-            media_type=cover.mime_type,
-            headers={
-                "ETag": cover.file_sha256,
-                "Cache-Control": "private, max-age=31536000, immutable",
-            },
-        )
+        return RedirectResponse(redirect_url, status_code=302)
 
     return router
 
@@ -1197,6 +1316,7 @@ def song_response(song: StoredSong, *, liked_at: str | None = None) -> SongRespo
         audio_url=audio_url,
         download_url=audio_url,
         cover_url=cover_url,
+        has_cover=song.has_cover,
         is_liked=liked_at is not None,
         liked_at=liked_at,
         created_at=song.created_at,
@@ -1258,6 +1378,16 @@ def playlist_detail_response(
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_iso_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _clean_song_tags(tags: str | list[str]) -> list[str]:

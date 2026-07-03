@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ActivityIndicator, Modal, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Alert, Modal, Pressable, StyleSheet, Text, View } from "react-native";
 
 import { usePlayer } from "@/components/PlayerProvider";
 import { loadStoredSession } from "@/lib/auth";
@@ -26,6 +26,7 @@ type SongActionMenuProps = {
   onDownload?: (song: Song) => Promise<void> | void;
   onLikeChanged?: (songId: string, isLiked: boolean, likedAt: string | null) => Promise<void> | void;
   onRemovedFromPlaylist?: () => Promise<void> | void;
+  onRemoveDownload?: (song: Song) => Promise<void> | void;
 };
 
 export function SongActionMenu({
@@ -40,6 +41,7 @@ export function SongActionMenu({
   onDownload,
   onLikeChanged,
   onRemovedFromPlaylist,
+  onRemoveDownload,
 }: SongActionMenuProps) {
   const { playNext } = usePlayer();
   const tagPreview = songTagSummary(song);
@@ -93,6 +95,42 @@ export function SongActionMenu({
       closeAfterAction();
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "Could not download song.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function confirmRemoveDownload() {
+    if (busy || !isDownloaded || !onRemoveDownload) {
+      return;
+    }
+    Alert.alert(
+      "Remove download?",
+      "This removes the local audio file from this device. The song will stay in your library.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Remove",
+          style: "destructive",
+          onPress: () => {
+            void removeDownload();
+          },
+        },
+      ],
+    );
+  }
+
+  async function removeDownload() {
+    if (busy || !isDownloaded || !onRemoveDownload) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await onRemoveDownload(song);
+      closeAfterAction();
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Could not remove download.");
     } finally {
       setBusy(false);
     }
@@ -211,15 +249,17 @@ export function SongActionMenu({
                 {onDownload ? (
                   <Pressable
                     accessibilityRole="button"
-                    disabled={!accessToken || busy || isDownloaded}
-                    onPress={downloadSong}
+                    disabled={!accessToken || busy || (isDownloaded ? !onRemoveDownload : false)}
+                    onPress={isDownloaded ? confirmRemoveDownload : downloadSong}
                     style={({ pressed }) => [
                       styles.actionRow,
                       pressed && styles.pressed,
-                      (!accessToken || busy || isDownloaded) && styles.disabled,
+                      (!accessToken || busy || (isDownloaded ? !onRemoveDownload : false)) && styles.disabled,
                     ]}>
-                    <Text style={[styles.actionIcon, isDownloaded && styles.downloadedIcon]}>{isDownloaded ? "✓" : "↓"}</Text>
-                    <Text style={styles.actionText}>{isDownloaded ? "Downloaded" : "Download"}</Text>
+                    <Text style={[styles.actionIcon, isDownloaded && styles.removeIcon]}>{isDownloaded ? "×" : "↓"}</Text>
+                    <Text style={[styles.actionText, isDownloaded && styles.removeText]}>
+                      {isDownloaded ? "Remove Download" : "Download"}
+                    </Text>
                   </Pressable>
                 ) : null}
                 <Pressable
@@ -368,8 +408,11 @@ const styles = StyleSheet.create({
   likeActive: {
     color: theme.colors.tint,
   },
-  downloadedIcon: {
-    color: theme.colors.green,
+  removeIcon: {
+    color: theme.colors.tint,
+  },
+  removeText: {
+    color: theme.colors.tint,
   },
   actionText: {
     color: theme.colors.text,

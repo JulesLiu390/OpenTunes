@@ -58,7 +58,7 @@ export default function OnboardingScreen() {
     }
     const input = profileInput.trim();
     if (!input) {
-      setError("Tell OpenBand what you like first.");
+      setError("Tell OpenTunes what you like first.");
       return;
     }
 
@@ -95,7 +95,7 @@ export default function OnboardingScreen() {
             <Text style={styles.eyebrow}>Taste Setup</Text>
             <Text style={styles.title}>What do you love?</Text>
             <Text style={styles.subtitle}>
-              OpenBand will turn your favorite artists, songs, sounds, moods, and dislikes into music taste tags.
+              OpenTunes will turn your favorite artists, songs, sounds, moods, and dislikes into music taste tags.
             </Text>
           </View>
 

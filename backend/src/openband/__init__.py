@@ -1,2 +1,2 @@
-"""OpenBand backend service modules."""
+"""OpenTunes backend service modules."""
 

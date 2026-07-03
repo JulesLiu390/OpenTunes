@@ -8,6 +8,7 @@ import { MusicPage } from "@/components/MusicPage";
 import { usePlayer } from "@/components/PlayerProvider";
 import { SongActionMenu } from "@/components/SongActionMenu";
 import { SongArtwork } from "@/components/SongArtwork";
+import { SongListRow } from "@/components/SongListRow";
 import {
   DailyPlaylistSummary,
   DailyTodayResponse,
@@ -22,6 +23,7 @@ import {
   Song,
   SongCacheStatus,
   cacheSong,
+  deleteCachedSong,
   formatDuration,
   getSongCacheStatuses,
   listSongs,
@@ -79,7 +81,7 @@ export default function DailyScreen() {
   const [history, setHistory] = useState<DailyPlaylistSummary[]>([]);
   const [selectedTrack, setSelectedTrack] = useState({
     title: "Daily",
-    subtitle: "OpenBand",
+    subtitle: "OpenTunes",
   });
   const [cacheStatus, setCacheStatus] = useState<Record<string, SongCacheStatus>>({});
   const [loading, setLoading] = useState(false);
@@ -335,9 +337,6 @@ export default function DailyScreen() {
       return;
     }
 
-    if (cacheStatus[song.id] !== "cached") {
-      setCacheStatus((current) => ({ ...current, [song.id]: "downloading" }));
-    }
     try {
       const result = await playSong(song, songs, { source: "daily" });
       if (result) {
@@ -373,14 +372,19 @@ export default function DailyScreen() {
     }
     setCacheStatus((current) => ({ ...current, [song.id]: "downloading" }));
     try {
-      await cacheSong(song, session.accessToken);
+      const result = await cacheSong(song, session.accessToken);
       await mergeSongCatalog(session.user.id, [song]);
       setCatalogSongs((current) => uniqueSongsById([...current, song]));
-      setCacheStatus((current) => ({ ...current, [song.id]: "cached" }));
+      setCacheStatus((current) => ({ ...current, [song.id]: result.cached ? "cached" : "remote" }));
     } catch (exc) {
       setCacheStatus((current) => ({ ...current, [song.id]: "remote" }));
       throw exc;
     }
+  }
+
+  async function removeDownload(song: Song) {
+    await deleteCachedSong(song);
+    setCacheStatus((current) => ({ ...current, [song.id]: "remote" }));
   }
 
   function updateSongLike(songId: string, isLiked: boolean, likedAt: string | null) {
@@ -589,47 +593,29 @@ export default function DailyScreen() {
               const displaySong = currentSong?.id === song.id ? currentSong : song;
               const tagPreview = songTagSummary(displaySong);
               return (
-                <Pressable
+                <SongListRow
+                  accessToken={session?.accessToken ?? null}
+                  action={
+                    <SongActionMenu
+                      accessToken={session?.accessToken ?? null}
+                      isDownloaded={cacheStatus[displaySong.id] === "cached"}
+                      isLiked={Boolean(displaySong.is_liked)}
+                      onDownload={downloadSong}
+                      onLikeChanged={updateSongLike}
+                      onRemoveDownload={removeDownload}
+                      song={displaySong}
+                    />
+                  }
+                  colors={artworkPalettes[index % artworkPalettes.length]}
+                  isCached={cacheStatus[song.id] === "cached"}
                   key={song.id}
                   onPress={() => selectSong(song)}
-                  style={({ pressed }) => [styles.trackRow, pressed && styles.pressed]}>
-                  <SongArtwork
-                    accessToken={session?.accessToken ?? null}
-                    colors={artworkPalettes[index % artworkPalettes.length]}
-                    size={50}
-                    song={displaySong}
-                  />
-                  <View style={styles.trackCopy}>
-                    <View style={styles.trackTitleLine}>
-                      <Text style={styles.trackTitle} numberOfLines={1}>
-                        {displaySong.title}
-                      </Text>
-                      {displaySong.is_liked ? <Text style={styles.likeBadge}>♥</Text> : null}
-                    </View>
-                    {tagPreview ? (
-                      <Text style={styles.trackMeta} numberOfLines={1}>
-                        {tagPreview}
-                      </Text>
-                    ) : null}
-                  </View>
-                  <View style={styles.trailing}>
-                    <Text
-                      style={[
-                        styles.duration,
-                        (cacheStatus[song.id] === "cached" || currentSong?.id === song.id) && styles.cached,
-                      ]}>
-                      {songStatusText(song, cacheStatus[song.id], busySongId, currentSong?.id, isPlaying)}
-                    </Text>
-                  </View>
-                  <SongActionMenu
-                    accessToken={session?.accessToken ?? null}
-                    isDownloaded={cacheStatus[displaySong.id] === "cached"}
-                    isLiked={Boolean(displaySong.is_liked)}
-                    onDownload={downloadSong}
-                    onLikeChanged={updateSongLike}
-                    song={displaySong}
-                  />
-                </Pressable>
+                  isLiked={Boolean(displaySong.is_liked)}
+                  song={displaySong}
+                  statusActive={currentSong?.id === song.id}
+                  statusText={songStatusText(song, cacheStatus[song.id], busySongId, currentSong?.id, isPlaying)}
+                  subtitle={tagPreview}
+                />
               );
             })
           ) : (
@@ -656,9 +642,6 @@ function songStatusText(
   }
   if (currentSongId === song.id && isPlaying) {
     return "Playing";
-  }
-  if (cacheStatus === "cached") {
-    return "Cached";
   }
   return formatDuration(song.duration_seconds);
 }

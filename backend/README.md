@@ -13,7 +13,7 @@ The goal is not to recommend the old catalog directly. The goal is to learn:
 This matches AI music platforms where songs are new, cold-started, and already
 come with tags or prompt metadata.
 
-OpenBand also has a small backend-owned MP3 song library. The database stores
+OpenTunes also has a small backend-owned MP3 song library. The database stores
 song metadata, tags, file size, and file hash; the MP3 file stays on disk. Cover
 art can remain embedded inside the MP3, so this version does not require a
 separate cover image file or table.
@@ -214,7 +214,7 @@ POST /v1/rank
 
 ## Auth And Accounts
 
-OpenBand uses one-time invite keys for first login. An admin creates a key, the
+OpenTunes uses one-time invite keys for first login. An admin creates a key, the
 client logs in with it once, and the backend returns a 15-minute access token
 plus a 30-day refresh token. Protected API calls use:
 

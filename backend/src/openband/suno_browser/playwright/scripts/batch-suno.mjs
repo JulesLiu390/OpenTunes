@@ -110,6 +110,16 @@ const section = (text, heading) => {
   return text.match(pattern)?.[1]?.trim();
 };
 
+const keyValueSection = (value) => {
+  const result = {};
+  for (const line of String(value || '').split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$/);
+    if (!match) continue;
+    result[match[1].toLowerCase().replace(/-/g, '_')] = match[2];
+  }
+  return result;
+};
+
 const sanitizeFilename = (value) => value.replace(/[\\/:*?"<>|]/g, '-');
 
 const slugify = (value) =>
@@ -814,7 +824,11 @@ const parseSongFile = (file, index) => {
   const selectedBrief = section(md, 'Selected Brief') || '';
   const title = selectedBrief.match(/"title_seed":\s*"([^"]+)"/)?.[1];
   const style = section(md, 'Style Prompt');
-  const lyrics = section(md, 'Lyrics');
+  const llmLyrics = section(md, 'Lyrics');
+  const submit = keyValueSection(section(md, 'Suno Submit'));
+  const submitLyricsMode = String(submit.lyrics_mode || '').trim().toLowerCase();
+  const lyricsMode = submitLyricsMode === 'suno' ? 'suno' : (llmLyrics ? 'llm' : 'suno');
+  const lyrics = lyricsMode === 'suno' ? '' : llmLyrics;
 
   if (!title || (!style && !lyrics)) {
     throw new Error(`Could not parse title/style/lyrics from ${file}`);
@@ -826,6 +840,8 @@ const parseSongFile = (file, index) => {
     title,
     style,
     lyrics,
+    lyricsMode: lyricsMode || (lyrics ? 'llm' : 'suno'),
+    llmLyricsChars: llmLyrics?.length || 0,
     slug: `${String(index + 1).padStart(2, '0')}-${slugify(title || basename(file))}`,
     beforeUrls: new Set(),
     observedRows: [],
@@ -940,7 +956,7 @@ const waitForSubmissionEvidence = async ({ page, task, waitMs, maxScrolls, scree
     }
 
     await sleep(2_000);
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+    await openCreatePage({ page }).catch(() => {});
     await page.waitForTimeout(1_000);
   }
 
@@ -1200,6 +1216,113 @@ const scrollSongListDown = async ({ page, stepPx = null } = {}) =>
     };
   }, stepPx);
 
+const collapseBlockingBottomTrayIfPresent = async ({ page } = {}) => {
+  let clicked = false;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const target = await page
+      .evaluate((attempt) => {
+        const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+        const visible = (el) => {
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.bottom > 0 &&
+            rect.top < window.innerHeight &&
+            rect.right > 0 &&
+            rect.left < window.innerWidth
+          );
+        };
+        const rectOf = (el) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            x: rect.x,
+            y: rect.y,
+            left: rect.left,
+            top: rect.top,
+            width: rect.width,
+            height: rect.height,
+            right: rect.right,
+            bottom: rect.bottom
+          };
+        };
+        const looksLikeStudioTray = (text) =>
+          /Master Your Studio/i.test(text) ||
+          /Time left\s+\d+\s+days?/i.test(text) ||
+          /Convert to MIDI|Pull it apart|Remaster/i.test(text) ||
+          (/Layer it up/i.test(text) && /Generate vocals or instrumentals/i.test(text));
+
+        const trays = [...document.querySelectorAll('body *')]
+          .filter(visible)
+          .map((el) => ({ el, rect: rectOf(el), text: normalize(el.innerText || el.textContent || '') }))
+          .filter(
+            ({ rect, text }) =>
+              rect.top > window.innerHeight * 0.45 &&
+              rect.width > window.innerWidth * 0.4 &&
+              rect.height > 48 &&
+              looksLikeStudioTray(text)
+          )
+          .sort((a, b) => a.rect.top - b.rect.top || b.rect.width * b.rect.height - a.rect.width * a.rect.height);
+
+        const tray = trays[0];
+        if (!tray) return null;
+
+        const buttons = [...document.querySelectorAll('button, [role="button"], [aria-label], [title]')]
+          .filter(visible)
+          .map((el) => ({
+            rect: rectOf(el),
+            label: normalize(el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '')
+          }))
+          .filter(
+            ({ rect }) =>
+              rect.x >= 200 &&
+              rect.y >= tray.rect.y - 80 &&
+              rect.y <= tray.rect.y + Math.min(120, tray.rect.height) &&
+              rect.width >= 20 &&
+              rect.height >= 20
+          )
+          .sort((a, b) => {
+            const preferredLabel = (button) => /close|collapse|minimi[sz]e|hide|dismiss|down|chevron/i.test(button.label);
+            const sideScore = (button) => (button.rect.x > window.innerWidth - 180 ? 0 : 1);
+            const topDistance = (button) => Math.abs(button.rect.y + button.rect.height / 2 - (tray.rect.y + 28));
+            return (
+              Number(!preferredLabel(a)) - Number(!preferredLabel(b)) ||
+              sideScore(a) - sideScore(b) ||
+              topDistance(a) - topDistance(b) ||
+              b.rect.x - a.rect.x
+            );
+          });
+
+        const button = buttons[0];
+        if (button) {
+          return {
+            x: button.rect.x + button.rect.width / 2,
+            y: button.rect.y + button.rect.height / 2,
+            reason: button.label || 'studio-tray-button'
+          };
+        }
+
+        return {
+          x: Math.min(window.innerWidth - 24, tray.rect.x + tray.rect.width - 28),
+          y: tray.rect.y + Math.min(34, tray.rect.height / 3),
+          reason: 'studio-tray-fallback'
+        };
+      }, attempt)
+      .catch(() => null);
+
+    if (!target) return clicked;
+    clicked = true;
+    await humanMouseClick(page, target.x, target.y).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+
+  return clicked;
+};
+
 const getVisibleRowsForTitle = async ({ page, title }) =>
   page.evaluate((title) => {
     const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
@@ -1219,24 +1342,38 @@ const getVisibleRowsForTitle = async ({ page, title }) =>
     };
     const rectOf = (el) => {
       const rect = el.getBoundingClientRect();
-      return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      return {
+        x: rect.x,
+        y: rect.y,
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+        right: rect.right,
+        bottom: rect.bottom
+      };
     };
     const clickableBottom = (() => {
       const viewportHeight = window.innerHeight;
+      const looksLikeBlockingTray = (text) =>
+        /Master Your Studio/i.test(text) ||
+        /Time left\s+\d+\s+days?/i.test(text) ||
+        /Convert to MIDI|Pull it apart|Remaster/i.test(text) ||
+        (/Layer it up/i.test(text) && /Generate vocals or instrumentals/i.test(text));
       const overlayTops = [...document.querySelectorAll('body *')]
         .filter(visible)
         .map((el) => {
           const style = window.getComputedStyle(el);
           const rect = el.getBoundingClientRect();
-          return { position: style.position, rect };
+          const text = normalize(el.innerText || el.textContent || '');
+          return { position: style.position, rect, text };
         })
         .filter(
-          ({ position, rect }) =>
-            /fixed|sticky/.test(position) &&
+          ({ position, rect, text }) =>
             rect.top > viewportHeight * 0.6 &&
-            rect.bottom >= viewportHeight - 4 &&
             rect.height >= 48 &&
-            rect.width >= window.innerWidth * 0.4
+            rect.width >= window.innerWidth * 0.4 &&
+            ((/fixed|sticky/.test(position) && rect.bottom >= viewportHeight - 4) || looksLikeBlockingTray(text))
         )
         .map(({ rect }) => rect.top);
 
@@ -1261,16 +1398,36 @@ const getVisibleRowsForTitle = async ({ page, title }) =>
       .filter(
         (button) =>
           safelyClickable(button.rect) &&
-          button.rect.x > window.innerWidth * 0.78 &&
+          button.rect.x > window.innerWidth * 0.75 &&
+          !/manage|remix/i.test(button.label) &&
+          (/more|options|ellipsis|menu|•••|\.\.\./i.test(button.label) ||
+            (button.rect.x > window.innerWidth * 0.9 && button.rect.width <= 80)) &&
           button.rect.width >= 28 &&
           button.rect.height >= 28
       );
 
-    return [...document.querySelectorAll('a[href*="/song/"]')]
+    const songNodes = [
+      ...document.querySelectorAll('a[href*="/song/"]'),
+      ...document.querySelectorAll('body *')
+    ];
+    const seen = new Set();
+    const songs = songNodes
       .filter(visible)
-      .map((el) => ({ text: normalize(el.textContent), href: el.href, rect: rectOf(el) }))
+      .map((el) => {
+        const rect = rectOf(el);
+        const href = el.href || el.closest?.('a[href*="/song/"]')?.href || '';
+        return { text: normalize(el.textContent), href, rect };
+      })
       .filter((song) => song.text === title && song.rect.x > 600)
-      .sort((a, b) => a.rect.y - b.rect.y)
+      .filter((song) => {
+        const key = `${song.href || 'nohref'}:${Math.round(song.rect.x)}:${Math.round(song.rect.y)}:${Math.round(song.rect.width)}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort((a, b) => a.rect.y - b.rect.y);
+
+    return songs
       .map((song) => {
         const centerY = song.rect.y + song.rect.height / 2;
         const duration = durations
@@ -1290,17 +1447,14 @@ const getVisibleRowsForTitle = async ({ page, title }) =>
         const fallbackMenuRect = {
           x: window.innerWidth - 76,
           y: centerY + 10,
+          left: window.innerWidth - 76,
+          top: centerY + 10,
           width: 48,
-          height: 48
+          height: 48,
+          right: window.innerWidth - 28,
+          bottom: centerY + 58
         };
-        const fallbackMenuButton = (
-          fallbackMenuRect.y >= 0 &&
-          fallbackMenuRect.x >= 0 &&
-          fallbackMenuRect.x + fallbackMenuRect.width <= window.innerWidth &&
-          fallbackMenuRect.y + fallbackMenuRect.height <= window.innerHeight - 100
-        )
-          ? { rect: fallbackMenuRect, synthetic: true }
-          : null;
+        const fallbackMenuButton = safelyClickable(fallbackMenuRect) ? { rect: fallbackMenuRect, synthetic: true } : null;
 
         return {
           ...song,
@@ -1314,8 +1468,132 @@ const getVisibleRowsForTitle = async ({ page, title }) =>
       });
   }, title);
 
+const getVisibleRowForHref = async ({ page, href }) =>
+  page.evaluate((href) => {
+    const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+    const visible = (el) => {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return (
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.bottom > 0 &&
+        rect.top < window.innerHeight &&
+        rect.right > 0 &&
+        rect.left < window.innerWidth
+      );
+    };
+    const rectOf = (el) => {
+      const rect = el.getBoundingClientRect();
+      return {
+        x: rect.x,
+        y: rect.y,
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+        right: rect.right,
+        bottom: rect.bottom
+      };
+    };
+    const clickableBottom = (() => {
+      const viewportHeight = window.innerHeight;
+      const looksLikeBlockingTray = (text) =>
+        /Master Your Studio/i.test(text) ||
+        /Time left\s+\d+\s+days?/i.test(text) ||
+        /Convert to MIDI|Pull it apart|Remaster/i.test(text) ||
+        (/Layer it up/i.test(text) && /Generate vocals or instrumentals/i.test(text));
+      const overlayTops = [...document.querySelectorAll('body *')]
+        .filter(visible)
+        .map((el) => {
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          const text = normalize(el.innerText || el.textContent || '');
+          return { position: style.position, rect, text };
+        })
+        .filter(
+          ({ position, rect, text }) =>
+            rect.top > viewportHeight * 0.6 &&
+            rect.height >= 48 &&
+            rect.width >= window.innerWidth * 0.4 &&
+            ((/fixed|sticky/.test(position) && rect.bottom >= viewportHeight - 4) || looksLikeBlockingTray(text))
+        )
+        .map(({ rect }) => rect.top);
+
+      return Math.min(viewportHeight - 24, ...(overlayTops.length ? overlayTops : [viewportHeight]));
+    })();
+    const safelyClickable = (rect) =>
+      rect.width > 0 &&
+      rect.height > 0 &&
+      rect.top >= 0 &&
+      rect.bottom <= clickableBottom - 8 &&
+      rect.left >= 0 &&
+      rect.right <= window.innerWidth;
+
+    const anchor = [...document.querySelectorAll('a[href*="/song/"]')].find((el) => el.href === href && visible(el));
+    if (!anchor) return null;
+
+    const song = { text: normalize(anchor.textContent), href: anchor.href, rect: rectOf(anchor) };
+    const centerY = song.rect.y + song.rect.height / 2;
+    const durations = [...document.querySelectorAll('body *')]
+      .filter(visible)
+      .map((el) => ({ text: normalize(el.textContent), rect: rectOf(el) }))
+      .filter((candidate) => /^\d+[:：]\d{2}$/.test(candidate.text));
+    const duration = durations
+      .filter((candidate) => Math.abs((candidate.rect.y + candidate.rect.height / 2) - centerY) < 100)
+      .sort(
+        (a, b) =>
+          Math.abs((a.rect.y + a.rect.height / 2) - centerY) -
+          Math.abs((b.rect.y + b.rect.height / 2) - centerY)
+      )[0];
+    const menuButtons = [...document.querySelectorAll('button[aria-label="More options"], button, [role="button"]')]
+      .filter(visible)
+      .map((el) => ({ rect: rectOf(el), label: normalize(el.getAttribute('aria-label') || el.textContent || '') }))
+      .filter(
+        (button) =>
+          safelyClickable(button.rect) &&
+          button.rect.x > window.innerWidth * 0.75 &&
+          !/manage|remix/i.test(button.label) &&
+          (/more|options|ellipsis|menu|•••|\.\.\./i.test(button.label) ||
+            (button.rect.x > window.innerWidth * 0.9 && button.rect.width <= 80)) &&
+          button.rect.width >= 28 &&
+          button.rect.height >= 28
+      );
+    const menuButton = menuButtons
+      .filter((button) => Math.abs((button.rect.y + button.rect.height / 2) - centerY) < 80)
+      .sort(
+        (a, b) =>
+          Math.abs((a.rect.y + a.rect.height / 2) - centerY) -
+          Math.abs((b.rect.y + b.rect.height / 2) - centerY)
+      )[0];
+    const fallbackMenuRect = {
+      x: window.innerWidth - 76,
+      y: centerY + 10,
+      left: window.innerWidth - 76,
+      top: centerY + 10,
+      width: 48,
+      height: 48,
+      right: window.innerWidth - 28,
+      bottom: centerY + 58
+    };
+    const fallbackMenuButton = safelyClickable(fallbackMenuRect) ? { rect: fallbackMenuRect, synthetic: true } : null;
+
+    return {
+      ...song,
+      duration: duration?.text || null,
+      durationSeconds: duration
+        ? Number(duration.text.replace('：', ':').split(':')[0]) * 60 +
+          Number(duration.text.replace('：', ':').split(':')[1])
+        : null,
+      menuButton: menuButton || fallbackMenuButton
+    };
+  }, href);
+
 const getRowsForTitle = async ({ page, title, maxScrolls = 40 }) => {
   const rowsByHref = new Map();
+  await collapseBlockingBottomTrayIfPresent({ page });
   await scrollSongListToTop({ page });
   await page.waitForTimeout(250);
 
@@ -1344,9 +1622,21 @@ const centerSongRowByHref = async ({ page, href }) =>
     return true;
   }, href);
 
+const visibleSearchBox = async ({ page }) => {
+  const inputs = page.locator('input[placeholder*="Search" i], input[aria-label*="Search" i]');
+  const count = await inputs.count().catch(() => 0);
+  for (let index = 0; index < count; index += 1) {
+    const input = inputs.nth(index);
+    if ((await input.isVisible().catch(() => false)) && (await input.isEditable().catch(() => false))) {
+      return input;
+    }
+  }
+  return null;
+};
+
 const searchSongList = async ({ page, title }) => {
-  const searchBox = page.getByPlaceholder(/search/i).first();
-  if ((await searchBox.count().catch(() => 0)) === 0) return false;
+  const searchBox = await visibleSearchBox({ page });
+  if (!searchBox) return false;
   await humanFill(searchBox, title, { timeout: 10_000 });
   await humanKeyPress(page, 'Enter').catch(() => {});
   await page.waitForTimeout(4_000);
@@ -1354,8 +1644,8 @@ const searchSongList = async ({ page, title }) => {
 };
 
 const clearSongSearch = async ({ page }) => {
-  const searchBox = page.getByPlaceholder(/search/i).first();
-  if ((await searchBox.count().catch(() => 0)) === 0) return false;
+  const searchBox = await visibleSearchBox({ page });
+  if (!searchBox) return false;
   await humanFill(searchBox, '', { timeout: 10_000 });
   await humanKeyPress(page, 'Escape').catch(() => {});
   await page.waitForTimeout(1_000);
@@ -1364,23 +1654,20 @@ const clearSongSearch = async ({ page }) => {
 
 const revealRowByHref = async ({ page, title, href, maxScrolls = 40 }) => {
   const scanLoadedList = async () => {
+    await collapseBlockingBottomTrayIfPresent({ page });
     await scrollSongListToTop({ page });
     await page.waitForTimeout(250);
 
     for (let scanStep = 0; scanStep < maxScrolls; scanStep += 1) {
-      const visibleRows = await getVisibleRowsForTitle({ page, title });
-      const row = visibleRows.find((candidate) => candidate.href === href && candidate.menuButton);
-      if (row) return { ...row, scanStep };
+      const row = await getVisibleRowForHref({ page, href });
+      if (row?.menuButton && row.durationSeconds !== null) return { ...row, scanStep };
 
-      const unsafeRow = visibleRows.find((candidate) => candidate.href === href);
-      if (unsafeRow) {
-        const centered = await centerSongRowByHref({ page, href });
-        if (centered) {
-          await page.waitForTimeout(450);
-          const centeredRows = await getVisibleRowsForTitle({ page, title });
-          const centeredRow = centeredRows.find((candidate) => candidate.href === href && candidate.menuButton);
-          if (centeredRow) return { ...centeredRow, scanStep };
-        }
+      const centered = await centerSongRowByHref({ page, href });
+      if (centered) {
+        await collapseBlockingBottomTrayIfPresent({ page });
+        await page.waitForTimeout(450);
+        const centeredRow = await getVisibleRowForHref({ page, href });
+        if (centeredRow?.menuButton && centeredRow.durationSeconds !== null) return { ...centeredRow, scanStep };
       }
 
       const state = await scrollSongListDown({ page });
@@ -1394,7 +1681,7 @@ const revealRowByHref = async ({ page, title, href, maxScrolls = 40 }) => {
   const currentRow = await scanLoadedList();
   if (currentRow) return currentRow;
 
-  if (await searchSongList({ page, title })) {
+  if (title && (await searchSongList({ page, title }))) {
     const searchedRow = await scanLoadedList();
     if (searchedRow) return searchedRow;
   }
@@ -1404,6 +1691,7 @@ const revealRowByHref = async ({ page, title, href, maxScrolls = 40 }) => {
 
 const revealBestRowByTitle = async ({ page, title, maxScrolls = 120 }) => {
   await clearSongSearch({ page });
+  await collapseBlockingBottomTrayIfPresent({ page });
   await scrollSongListToTop({ page });
   await page.waitForTimeout(500);
 
@@ -1427,6 +1715,7 @@ const revealBestRowByTitle = async ({ page, title, maxScrolls = 120 }) => {
     if (bestUnsafeRow?.href) {
       const centered = await centerSongRowByHref({ page, href: bestUnsafeRow.href });
       if (centered) {
+        await collapseBlockingBottomTrayIfPresent({ page });
         await page.waitForTimeout(450);
         const centeredRows = await getVisibleRowsForTitle({ page, title });
         const centeredSafeRows = centeredRows
@@ -1449,13 +1738,28 @@ const downloadRow = async ({ page, task, row, downloadDir, screenshotDir }) => {
 
   await humanKeyPress(page, 'Escape').catch(() => {});
   await page.waitForTimeout(200);
+  await collapseBlockingBottomTrayIfPresent({ page });
   await humanMouseClick(
     page,
     row.menuButton.rect.x + row.menuButton.rect.width / 2,
     row.menuButton.rect.y + row.menuButton.rect.height / 2
   );
   await page.waitForTimeout(200);
-  await humanClick(page.getByRole('button', { name: 'Download' }), { timeout: 10_000 });
+  const downloadButton = page.getByRole('button', { name: 'Download' });
+  try {
+    await humanClick(downloadButton, { timeout: 3_000 });
+  } catch (error) {
+    await collapseBlockingBottomTrayIfPresent({ page });
+    await humanKeyPress(page, 'Escape').catch(() => {});
+    await page.waitForTimeout(200);
+    await humanMouseClick(
+      page,
+      row.menuButton.rect.x + row.menuButton.rect.width / 2,
+      row.menuButton.rect.y + row.menuButton.rect.height / 2
+    );
+    await page.waitForTimeout(200);
+    await humanClick(downloadButton, { timeout: 10_000 });
+  }
   await page.waitForTimeout(200);
   await page.screenshot({ path: join(screenshotDir, task.slug, 'download-menu.png'), fullPage: true });
 
@@ -1639,7 +1943,9 @@ if (dryRun) {
           file: task.file,
           title: task.title,
           styleChars: task.style?.length || 0,
-          lyricsChars: task.lyrics?.length || 0
+          lyricsChars: task.lyrics?.length || 0,
+          llmLyricsChars: task.llmLyricsChars || 0,
+          lyricsMode: task.lyricsMode
         }))
       },
       null,
@@ -1733,7 +2039,7 @@ try {
   let lastWaitingScreenshotAt = 0;
 
   while (Date.now() - startedAt < timeoutMs) {
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+    await openCreatePage({ page }).catch(() => {});
     await page.waitForTimeout(2_500);
     
     // 替换为 handleCaptchaIfRequired [位置 4/5]
@@ -1794,7 +2100,7 @@ try {
     let selected = null;
 
     for (let attempt = 1; attempt <= 6; attempt += 1) {
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+      await openCreatePage({ page }).catch(() => {});
       await page.waitForTimeout(1_500 + attempt * 750);
       
       // 替换为 handleCaptchaIfRequired [位置 5/5]
@@ -1804,7 +2110,17 @@ try {
         screenshotPath: join(screenshotDir, task.slug, 'error-captcha-before-download.png')
       });
 
-      selected = await revealBestRowByTitle({ page, title: task.title });
+      if (task.selectedRow?.href) {
+        selected = await revealRowByHref({
+          page,
+          title: task.title,
+          href: task.selectedRow.href,
+          maxScrolls
+        });
+      }
+      if (!selected?.menuButton || selected.durationSeconds === null) {
+        selected = await revealBestRowByTitle({ page, title: task.title });
+      }
       if (selected) task.selectedRow = selected;
       if (selected) break;
     }

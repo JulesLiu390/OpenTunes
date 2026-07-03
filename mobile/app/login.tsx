@@ -160,7 +160,7 @@ export default function LoginScreen() {
       const scans = await scanFromURLAsync(uri, ["qr"]);
       const qrData = scans.find((scan) => scan.data)?.data;
       if (!qrData) {
-        setError("No OpenBand QR code was found in that image.");
+        setError("No OpenTunes QR code was found in that image.");
         return;
       }
       stageQrData(qrData);
@@ -202,7 +202,7 @@ export default function LoginScreen() {
             <View style={styles.mark}>
               <Text style={styles.markText}>♪</Text>
             </View>
-            <Text style={styles.title}>OpenBand</Text>
+            <Text style={styles.title}>OpenTunes</Text>
             <Text style={styles.subtitle}>Private, friends-only music.</Text>
           </View>
 

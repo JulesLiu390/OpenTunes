@@ -23,6 +23,7 @@ from openband.daily import (
     DailyStore,
     create_daily_router,
 )
+from openband.dev_simulation import create_dev_simulation_router
 from openband.prompt_generation import cli as prompt_cli
 from openband.prompt_generation.profile_service import (
     GeneratedMusicProfile,
@@ -34,6 +35,11 @@ from openband.songs import (
     SongStore,
     create_playlist_router,
     create_song_router,
+)
+from openband.storage import (
+    local_cache_days,
+    presigned_url_ttl,
+    r2_storage_from_env,
 )
 from pydantic import BaseModel, Field
 
@@ -141,6 +147,9 @@ def create_app(
     app.state.song_store = SongStore(
         db_path=configured_auth_db_path,
         storage_root=Path(song_storage_root or os.getenv(SONG_STORAGE_ROOT_ENV, DEFAULT_SONG_STORAGE_ROOT)),
+        object_storage=r2_storage_from_env(),
+        cache_days=local_cache_days(),
+        url_ttl=presigned_url_ttl(),
     )
     app.state.daily_store = DailyStore(configured_auth_db_path)
     app.state.daily_generator = daily_generator or DailyGenerationService(
@@ -184,6 +193,14 @@ def create_app(
             song_store=app.state.song_store,
             auth_store=app.state.auth_store,
             require_auth=require_auth,
+        )
+    )
+    app.include_router(
+        create_dev_simulation_router(
+            auth_store=app.state.auth_store,
+            daily_store=app.state.daily_store,
+            song_store=app.state.song_store,
+            admin_key=configured_admin_key,
         )
     )
     current_user = (

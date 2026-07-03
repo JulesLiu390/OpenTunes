@@ -17,7 +17,7 @@ export function parseInviteQrPayload(value: string): InviteQrPayload {
   try {
     parsed = new URL(trimmedValue);
   } catch {
-    throw new Error("This QR code is not an OpenBand invite.");
+    throw new Error("This QR code is not an OpenTunes invite.");
   }
 
   const key =
@@ -26,7 +26,7 @@ export function parseInviteQrPayload(value: string): InviteQrPayload {
     parsed.searchParams.get("inviteKey") ||
     "";
   if (!key.startsWith(INVITE_KEY_PREFIX)) {
-    throw new Error("This QR code does not contain an OpenBand invite key.");
+    throw new Error("This QR code does not contain an OpenTunes invite key.");
   }
 
   const apiBaseUrlValue =

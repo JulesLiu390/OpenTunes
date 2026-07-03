@@ -1,8 +1,10 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from mutagen.id3 import APIC, ID3
 
+import openband.daily as daily_module
 from music_taste_rec.api import create_app
 from openband.auth import AuthStore, AuthUser
 from openband.daily import DailyGenerationContext, DailyGenerationService, DailyStore
@@ -47,6 +49,72 @@ def _mp3_with_cover(tmp_path: Path) -> bytes:
     )
     tags.save(path)
     return path.read_bytes()
+
+
+def test_daily_prompt_can_mark_suno_generated_lyrics(monkeypatch, tmp_path: Path) -> None:
+    service = DailyGenerationService(
+        model_path=tmp_path / "missing-model.joblib",
+        responses_url="http://localhost.test",
+        responses_model="test-model",
+        runtime_root=tmp_path / "daily",
+    )
+    service._style_prompt_tags = lambda _style_prompt: ["nu metal"]  # type: ignore[method-assign]
+
+    monkeypatch.setattr(
+        daily_module.prompt_cli,
+        "run_brief_candidates",
+        lambda *_args, **_kwargs: ([{"title_seed": "One Song"}], 0, {"title_seed": "One Song"}),
+    )
+    monkeypatch.setattr(
+        daily_module.prompt_cli,
+        "selected_brief_user_text",
+        lambda *_args, **_kwargs: "selected brief request",
+    )
+    monkeypatch.setattr(
+        daily_module.prompt_cli,
+        "apply_profile",
+        lambda user_text, _profile: user_text,
+    )
+    flow_result = (
+        "# Suno Prompt Result\n\n"
+        "## Selected Brief\n\n"
+        '{"title_seed": "One Song"}\n\n'
+        "## Style Prompt\n\n"
+        "nu metal, hard rock\n\n"
+        "## Lyrics\n\n"
+        "[Chorus]\nSing this line\n"
+    )
+    monkeypatch.setattr(
+        daily_module.prompt_cli,
+        "run_generation_flow",
+        lambda *_args, **_kwargs: ("", flow_result),
+    )
+    monkeypatch.setattr(
+        daily_module.prompt_cli,
+        "format_song_brief_result",
+        lambda **_kwargs: flow_result,
+    )
+    monkeypatch.setattr(daily_module.secrets, "randbelow", lambda _upper: 0)
+
+    manifest = service._generate_song_prompts(
+        args=SimpleNamespace(),
+        api_key="test-key",
+        profile={},
+        seed={"songs": [{"index": 1, "tags": ["nu metal"]}]},
+        prompt_dir=tmp_path,
+        date_value="2026-06-25",
+    )
+
+    assert manifest[0]["lyrics_mode"] == "suno"
+    prompt_text = Path(manifest[0]["prompt_file"]).read_text(encoding="utf-8")
+    assert "## Lyrics" in prompt_text
+    assert "Sing this line" in prompt_text
+    assert "## Suno Submit" in prompt_text
+    assert "lyrics_mode: suno" in prompt_text
+    assert "probability_percent: 30" in prompt_text
+    recovered = service._prompt_manifest_from_file(Path(manifest[0]["prompt_file"]), fallback_index=1)
+    assert recovered["lyrics_mode"] == "suno"
+    assert recovered["used_llm_lyrics"] is False
 
 
 class FakeDailyGenerator:
@@ -118,7 +186,7 @@ class FakeDailyGenerator:
             song = context.song_store.create_song_from_file(
                 source_path=source_path,
                 title=title,
-                artist="OpenBand Daily",
+                artist="OpenTunes Daily",
                 album=f"Daily {context.date}",
                 tags=tags,
                 duration_seconds=120 + index,
@@ -575,6 +643,7 @@ def test_daily_suno_import_keeps_one_library_song_per_prompt(tmp_path: Path) -> 
             "prompt_file": prompt_file,
             "selected_brief_index": 1,
             "selected_brief": {"title_seed": "One Song"},
+            "lyrics_mode": "suno",
             "song_metrics": {},
         }
     ]
@@ -602,7 +671,12 @@ def test_daily_suno_import_keeps_one_library_song_per_prompt(tmp_path: Path) -> 
     songs, total = song_store.list_songs(limit=10)
     assert total == 1
     assert songs[0].title == "One Song"
+    assert imported[0]["metadata"]["lyrics_mode"] == "suno"
+    assert imported[0]["metadata"]["used_llm_lyrics"] is False
     daily_store.replace_daily_songs(daily_playlist_id=playlist.id, songs=imported)
+    stored_daily_songs = daily_store.list_daily_songs(daily_playlist_id=playlist.id)
+    assert stored_daily_songs[0].metadata["lyrics_mode"] == "suno"
+    assert stored_daily_songs[0].metadata["used_llm_lyrics"] is False
 
     imported_again = service._import_batch_results(
         context=context,
